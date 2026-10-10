@@ -27,7 +27,7 @@ bind allowance described in that guide.
 | `systemd/carnical-host-audit.*` | The checks of the machine itself, as root with five capabilities and no network sockets, four times a day. |
 | `nftables/carnical.nft` | Early SYN and malformed-packet filtering, bounded echo/log budgets, and network policy by user. The edge: public addresses on 80 and 443 only. Everything else: this machine only. The metadata service: root only. See [L3/L4 protection](../docs/network-protection.md). |
 | `nftables/render_policy.py` | Render small, standard or large packet budgets and verified proxy-peer ranges. Prints a policy for review; loading it is an explicit administrator action. |
-| `sysctl/90-carnical.conf` | Kernel settings against ptrace, kernel address leaks, BPF, io_uring, user namespaces and link tricks. |
+| `sysctl/90-carnical.conf` | Kernel settings against ptrace, kernel address leaks, BPF, io_uring, user namespaces and link tricks, and TCP Fast Open (which connects without the call Landlock's port rules check). |
 | `modprobe/carnical.conf` | Kernel modules a web server does not need and attackers use. |
 | `auditd/carnical.rules` | What to record, chosen so that each record is an incident. |
 | `honeytokens.sh` | Files that look worth stealing and that nothing reads. |

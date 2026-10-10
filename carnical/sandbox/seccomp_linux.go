@@ -225,11 +225,26 @@ func buildFilter(allowExec bool) ([]unix.SockFilter, error) {
 	a.label("after-socket")
 	a.load(offNr)
 
+	// sendto, sendmsg and sendmmsg with MSG_FASTOPEN: on a new TCP socket that connects, sending the SYN itself, without
+	// the connect(2) that Landlock's port rule is checked on. Go never sets the flag. Refuse it with the error a kernel
+	// with client Fast Open switched off gives.
+	for _, send := range []struct{ nr, flagsArg uint32 }{{unix.SYS_SENDTO, 3}, {unix.SYS_SENDMSG, 2}, {unix.SYS_SENDMMSG, 3}} {
+		check := fmt.Sprintf("check-send-%d", send.nr)
+		after := fmt.Sprintf("after-send-%d", send.nr)
+		a.jeq(send.nr, check, after)
+		a.label(check)
+		a.load(offArg0 + 8*send.flagsArg) // the low half of the flags, all the kernel reads
+		a.jset(unix.MSG_FASTOPEN, "no-fastopen", "allow")
+		a.label(after)
+	}
+
 	a.jeq(unix.SYS_SOCKETPAIR, "check-pair", "allow")
 	a.label("check-pair")
 	a.load(offArg0)
 	a.jeq(unix.AF_UNIX, "allow", "kill")
 
+	a.label("no-fastopen")
+	a.ret(seccompRetErrnoBase | uint32(unix.EOPNOTSUPP))
 	a.label("no-proto")
 	a.ret(seccompRetErrnoBase | uint32(unix.EPROTONOSUPPORT))
 	a.label("allow")

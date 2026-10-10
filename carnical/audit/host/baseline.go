@@ -60,6 +60,7 @@ var Sysctls = []Setting{
 	{"net.ipv4.conf.all.log_martians", 1, true, false},
 	{"net.ipv4.tcp_syncookies", 1, true, false},
 	{"net.ipv4.icmp_echo_ignore_broadcasts", 1, true, false},
+	{"net.ipv4.tcp_fastopen", 0, false, false}, // a bit mask (1 client, 2 server): any bit set is not stricter
 }
 
 // Satisfied reports whether a value meets the setting.

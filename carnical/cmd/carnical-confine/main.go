@@ -156,6 +156,18 @@ var actions = []action{
 		return unix.Close(fd)
 	}},
 	{"connect to a port that is not allowed", ifABI(4, refused), allowed, func(e *env) error { return dial(e.forbiddenPort) }},
+	// TCP Fast Open connects from sendto(2), without the connect(2) that Landlock's port rule is checked on. Unconfined it
+	// works, or fails where the machine has client Fast Open switched off.
+	{"connect to a port that is not allowed with TCP Fast Open", always(refused), refusedOrErr, func(e *env) error {
+		fd, err := unix.Socket(unix.AF_INET, unix.SOCK_STREAM|unix.SOCK_CLOEXEC, 0)
+		if err != nil {
+			return err
+		}
+		err = unix.Sendto(fd, []byte("x"), unix.MSG_FASTOPEN, &unix.SockaddrInet4{Port: int(e.forbiddenPort), Addr: [4]byte{127, 0, 0, 1}})
+		// #nosec G104 -- The probe measures whether the send connected; cleanup cannot change that result.
+		unix.Close(fd)
+		return err
+	}},
 	{"listen on a port that is not allowed", ifABI(4, refused), allowed, func(e *env) error { return listen(e.bindNo) }},
 	{"connect to another process's abstract socket", ifABI(6, refused), allowed, func(e *env) error {
 		c, err := net.Dial("unix", "@"+e.abstract)

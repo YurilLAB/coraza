@@ -81,9 +81,10 @@ func TestTheFilterDecidesEachCallAsIntended(t *testing.T) {
 		t.Fatal(err)
 	}
 	const (
-		allow   = seccompRetAllow
-		kill    = seccompRetKillProcess
-		noProto = seccompRetErrnoBase | uint32(unix.EPROTONOSUPPORT)
+		allow      = seccompRetAllow
+		kill       = seccompRetKillProcess
+		noProto    = seccompRetErrnoBase | uint32(unix.EPROTONOSUPPORT)
+		noFastOpen = seccompRetErrnoBase | uint32(unix.EOPNOTSUPP)
 	)
 	tests := []struct {
 		name string
@@ -137,6 +138,17 @@ func TestTheFilterDecidesEachCallAsIntended(t *testing.T) {
 		{"socket: packet", block, seccompData(auditArch, unix.SYS_SOCKET, unix.AF_PACKET, unix.SOCK_RAW, 0), kill},
 		{"socket: kernel crypto", block, seccompData(auditArch, unix.SYS_SOCKET, unix.AF_ALG, unix.SOCK_SEQPACKET, 0), kill},
 		{"socket: vsock", block, seccompData(auditArch, unix.SYS_SOCKET, unix.AF_VSOCK, unix.SOCK_STREAM, 0), kill},
+		// TCP Fast Open connects without connect(2), where Landlock checks the port.
+		{"sendto with TCP Fast Open", block, seccompData(auditArch, unix.SYS_SENDTO, 3, 0, 1, unix.MSG_FASTOPEN, 0, 16), noFastOpen},
+		{"sendto with TCP Fast Open among other flags", block, seccompData(auditArch, unix.SYS_SENDTO, 3, 0, 1, unix.MSG_FASTOPEN|unix.MSG_NOSIGNAL|unix.MSG_DONTWAIT, 0, 16), noFastOpen},
+		{"sendto with ordinary flags", block, seccompData(auditArch, unix.SYS_SENDTO, 3, 0, 1, unix.MSG_NOSIGNAL|unix.MSG_DONTWAIT, 0, 0), allow},
+		{"sendto with the flag only in the high half, which the kernel ignores", block, seccompData(auditArch, unix.SYS_SENDTO, 3, 0, 1, uint64(unix.MSG_FASTOPEN)<<32, 0, 0), allow},
+		{"sendto with TCP Fast Open when starting programs is allowed", allowExec, seccompData(auditArch, unix.SYS_SENDTO, 3, 0, 1, unix.MSG_FASTOPEN, 0, 16), noFastOpen},
+		{"sendmsg with TCP Fast Open", block, seccompData(auditArch, unix.SYS_SENDMSG, 3, 0, unix.MSG_FASTOPEN), noFastOpen},
+		{"sendmsg with ordinary flags", block, seccompData(auditArch, unix.SYS_SENDMSG, 3, 0, unix.MSG_NOSIGNAL), allow},
+		{"sendmmsg with TCP Fast Open", block, seccompData(auditArch, unix.SYS_SENDMMSG, 3, 0, 1, unix.MSG_FASTOPEN), noFastOpen},
+		{"sendmmsg with ordinary flags", block, seccompData(auditArch, unix.SYS_SENDMMSG, 3, 0, 1, 0), allow},
+		{"recvfrom with the same bit set", block, seccompData(auditArch, unix.SYS_RECVFROM, 3, 0, 1, unix.MSG_FASTOPEN), allow},
 		{"socketpair: UNIX", block, seccompData(auditArch, unix.SYS_SOCKETPAIR, unix.AF_UNIX, unix.SOCK_STREAM, 0), allow},
 		{"socketpair: INET", block, seccompData(auditArch, unix.SYS_SOCKETPAIR, unix.AF_INET, unix.SOCK_STREAM, 0), kill},
 		{"a different architecture", block, seccompData(0x40000003, unix.SYS_READ), kill},
