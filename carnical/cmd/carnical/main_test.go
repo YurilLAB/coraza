@@ -1036,6 +1036,7 @@ func TestRequestFormatsAtCLI(t *testing.T) {
 		{name: "live local rules detect mode", mode: "block", extraArgs: []string{"-mode", "detect"}, method: "GET", target: "/api?q=%27%20or%20true%28%29", status: 200, logRule: `"rule":5006001`},
 		{name: "live local rules opt out", mode: "block", extraArgs: []string{"-mode", "block", "-local-rules=false"}, method: "GET", target: "/api?q=rO0ABXNyABFqYXZhLnV0aWwuSGFzaE1hcAUH", status: 200},
 		{name: "live supplemental quoted shell", mode: "block", extraArgs: []string{"-mode", "block"}, method: "GET", target: "/api?q=%3Bi%27%27d", status: 403, logRule: `"rule":5006003`},
+		{name: "live exploit path", mode: "block", extraArgs: []string{"-mode", "block"}, method: "GET", target: "/wp-content/uploads/2024/x.php.jpg", status: 403, logRule: `"rule":5006011,"severity":"critical","rule_msg":"Exploit or web shell path"`},
 		{name: "live parameter collision", mode: "block", ct: "application/x-www-form-urlencoded", body: "user.name=a&user_name=b", status: 400, logRule: `"rule":5002608`},
 		{name: "live XML attribute bypass", mode: "block", extraArgs: []string{"-mode", "block"}, ct: "application/xml", body: `<input value="' or true() or 'a'='b"/>`, status: 403, logRule: `"rule":5006001`},
 		{name: "default monitor logs a GET mutation", method: "GET", target: "/graphql?query=mutation%7BdeleteUser%7D", status: 200, logRule: `"rule":5002310`},

@@ -7,8 +7,8 @@ rules](../crs/local/), [CLI](../cmd/carnical/main.go).
 ## Local rules
 
 Carnical supplements the verified, unmodified CRS release with local rules under `crs/local/`. These
-inspect ARGS, XML text/attributes and cookies, adding five inbound PL1 anomaly points per finding
-before the CRS blocking evaluation. They load after CRS score initialization and before its attack
+inspect ARGS, XML text/attributes and cookies (5006011, the request path), adding five inbound PL1
+anomaly points per finding before the CRS blocking evaluation. They load after CRS score initialization and before its attack
 rules, preserving scores in multiphase builds. They share `-mode` and thresholds;
 `-local-rules=false` omits them. The library setting is `crs.Settings.DisableLocalRules`. URL, HTML
 and JavaScript decoding is for detection only; values are not rewritten.
@@ -21,6 +21,7 @@ and JavaScript decoding is for detection only; values are not rewritten.
 | 5006006 | Parent traversal, including nested percent-encoded markers |
 | 5006007 | Base64/hex Java serialization stream markers |
 | 5006008 | Non-HTTP fetch protocols and ambiguous numeric/userinfo authorities |
+| 5006011 | Paths only an attacker asks for: PHPUnit's `eval-stdin.php`, PHP in WordPress's uploads, cache or upgrade folders (also behind a second extension or path info), the File Manager connectors and PHP in its files folder, Slider Revolution's update folder, and well-known web shells by name. The path is decoded, normalized and lower-cased for matching. It runs for every site, since a scanner asks whether or not WordPress is there; the site's WordPress protections (`wordpress.enabled`) refuse scripts in more of its writable folders and limit logins and xmlrpc.php |
 
 Default match logs contain fixed family labels, rule IDs, severity and transaction IDs, omitting
 request content. `-log-details` enables sensitive details. Format rules 5002608/5002809 additionally

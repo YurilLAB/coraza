@@ -26,6 +26,8 @@ func LocalRuleMessage(id int) string {
 		return "XPath comment obfuscation after a quote"
 	case 5006010:
 		return "Obfuscated shell command spelling"
+	case 5006011:
+		return "Exploit or web shell path"
 	default:
 		return ""
 	}

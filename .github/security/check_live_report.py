@@ -11,7 +11,7 @@ def main():
         raise SystemExit("invalid live WAF measurement")
     supported = {"java", "ldap", "lfi", "nosql", "php", "protocol", "prototype",
                  "rce", "regression", "scanner", "sqli", "ssi", "ssrf", "ssti",
-                 "xpath", "xss", "xxe"}
+                 "wordpress", "xpath", "xss", "xxe"}
     categories = {row["Category"]: row for row in report["CategoryResults"]}
     if not supported.issubset(categories):
         raise SystemExit("missing required attack categories")
