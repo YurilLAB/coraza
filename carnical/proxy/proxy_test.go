@@ -7,6 +7,7 @@ import (
 	"bytes"
 	"fmt"
 	"io"
+	"log"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -64,6 +65,12 @@ func newUpstream(t testing.TB) *upstream {
 			w.Header().Set("Server", "Apache/2.4.58 (Ubuntu)")
 		case strings.HasSuffix(r.URL.Path, ".css"):
 			w.Header().Set("Content-Type", "text/html")
+		case r.URL.Path == "/cut":
+			// An application that dies part way through the body it announced.
+			w.Header().Set("Content-Length", "1000")
+			w.Write([]byte("part of a body"))
+			w.(http.Flusher).Flush()
+			panic(http.ErrAbortHandler)
 		}
 		w.Write([]byte("reached the application"))
 	}))
@@ -469,6 +476,28 @@ func TestOnlyTheConfiguredNumberOfRequestsReachTheUpstreamAtOnce(t *testing.T) {
 		t.Errorf("after the place was freed: %d", status)
 	}
 }
+
+func TestTheReverseProxysOwnLinesGoToItsErrorLog(t *testing.T) {
+	var mu sync.Mutex
+	var lines strings.Builder
+	s := start(t, func(c *Config) {
+		c.ErrorLog = log.New(writerFunc(func(p []byte) (int, error) {
+			mu.Lock()
+			defer mu.Unlock()
+			return lines.Write(p)
+		}), "", 0)
+	})
+	s.raw(t, get("/cut"))
+	mu.Lock()
+	defer mu.Unlock()
+	if !strings.Contains(lines.String(), "ReverseProxy read error during body copy") {
+		t.Fatalf("a body cut short by the application was not reported to ErrorLog: %q", lines.String())
+	}
+}
+
+type writerFunc func([]byte) (int, error)
+
+func (f writerFunc) Write(p []byte) (int, error) { return f(p) }
 
 func TestTheUpstreamHostCanBePinned(t *testing.T) {
 	plain := start(t, nil)

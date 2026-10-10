@@ -51,7 +51,9 @@ readiness without a restart. Explicit `-crowdsec-fail-open` keeps readiness heal
 unlisted visitors during staleness; existing bans still apply. Use that option only when the
 reviewed outage policy calls for it.
 
-On SIGTERM or an interrupt, readiness immediately becomes false. During `-drain-delay` the edge
+On SIGTERM, SIGHUP or an interrupt, readiness immediately becomes false (there is no configuration to
+reload, so a hang-up stops the edge the same way). A second signal during the stop ends the process at
+once, without waiting for the budget below. During `-drain-delay` the edge
 still accepts and inspects traffic already routed to it, and CrowdSec refresh continues. It then
 closes the visitor listener and lets active HTTP requests finish. `-shutdown-timeout` is the
 **total** budget including the delay: its default is 30s, configurable from 100ms to 10m. The delay

@@ -12,8 +12,12 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net/url"
 	"os"
 	"path/filepath"
+	"slices"
+	"strconv"
+	"strings"
 )
 
 // Private settings contain infrastructure details and references to credentials,
@@ -210,3 +214,86 @@ func newSiteKeyID() (string, error) {
 	}
 	return hex.EncodeToString(id), nil
 }
+
+// redactPrivate keeps the settings a site file stores encrypted out of an error that is about to be printed: each value as
+// written and as Go quotes it, each entry of a list, and an upstream's host, which lookups and dial errors name on their own.
+// The origin's resolved address follows from those settings, so addresses are left out too.
+func redactPrivate(err error, private map[string]string) error {
+	if err == nil || len(private) == 0 {
+		return err
+	}
+	type swap struct{ old, new string }
+	var swaps []swap
+	add := func(s string) {
+		if s = strings.TrimSpace(s); s == "" {
+			return
+		}
+		quoted := strconv.Quote(s)
+		if !strings.ContainsAny(s, `.:/\@`) {
+			// A single word, such as a one-label host, is replaced only where it can be nothing else, so that a host
+			// named "origin" leaves "origin preflight" readable.
+			swaps = append(swaps, swap{quoted, `"[private setting]"`}, swap{"lookup " + s, "lookup [private setting]"})
+			return
+		}
+		swaps = append(swaps, swap{s, "[private setting]"}, swap{quoted[1 : len(quoted)-1], "[private setting]"})
+	}
+	for name, value := range private {
+		add(value)
+		for _, item := range strings.Split(value, ",") {
+			add(item)
+		}
+		if u, perr := url.Parse(value); name == "upstream" && perr == nil {
+			add(u.Host)
+			add(u.Hostname())
+		}
+	}
+	slices.SortFunc(swaps, func(a, b swap) int { return len(b.old) - len(a.old) }) // a value that holds another goes first
+	text := err.Error()
+	for _, s := range swaps {
+		text = replaceWhole(text, s.old, s.new)
+	}
+	if text = redactAddresses(text); text == err.Error() {
+		return err
+	}
+	return redactedError{text: text, err: err}
+}
+
+// replaceWhole replaces old where it is not part of a longer name or word, so that a host named "origin" leaves
+// "originator" alone.
+func replaceWhole(text, old, replacement string) string {
+	alnum := func(c byte) bool { return c >= '0' && c <= '9' || c >= 'A' && c <= 'Z' || c >= 'a' && c <= 'z' }
+	part := func(s string, at int) bool {
+		if at < 0 || at >= len(s) {
+			return false
+		}
+		if c := s[at]; c == '.' || c == '-' {
+			return at+1 < len(s) && alnum(s[at+1]) // a dot or hyphen continues a name only before a letter or digit
+		}
+		return s[at] == '_' || alnum(s[at])
+	}
+	var out strings.Builder
+	for {
+		i := strings.Index(text, old)
+		if i < 0 {
+			out.WriteString(text)
+			return out.String()
+		}
+		end := i + len(old)
+		if part(text, i-1) || part(text, end) {
+			out.WriteString(text[:i+1])
+			text = text[i+1:]
+			continue
+		}
+		out.WriteString(text[:i])
+		out.WriteString(replacement)
+		text = text[end:]
+	}
+}
+
+type redactedError struct {
+	text string
+	err  error
+}
+
+func (e redactedError) Error() string { return e.text }
+func (e redactedError) Unwrap() error { return e.err }

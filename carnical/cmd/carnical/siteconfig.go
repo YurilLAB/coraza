@@ -18,20 +18,21 @@ const maxSiteConfigBytes = 64 << 10
 
 // loadSiteConfig uses registered CLI types and validators rather than a second
 // set of defaults. Explicit CLI flags override file settings. Files are operator
-// configuration, never customer-submitted or automatically fetched.
-func loadSiteConfig(path string, flags *flag.FlagSet) error {
+// configuration, never customer-submitted or automatically fetched. It returns
+// the settings that were stored encrypted, so that errors can leave them out.
+func loadSiteConfig(path string, flags *flag.FlagSet) (map[string]string, error) {
 	data, err := readSiteFile(path, maxSiteConfigBytes, false)
 	if err != nil {
-		return fmt.Errorf("site configuration: %w", err)
+		return nil, fmt.Errorf("site configuration: %w", err)
 	}
 	if !utf8.Valid(data) {
-		return errors.New("site configuration is not UTF-8")
+		return nil, errors.New("site configuration is not UTF-8")
 	}
 	dec := json.NewDecoder(bytes.NewReader(data))
 	dec.UseNumber()
 	token, err := dec.Token()
 	if err != nil || token != json.Delim('{') {
-		return errors.New("site configuration must be a JSON object")
+		return nil, errors.New("site configuration must be a JSON object")
 	}
 	seen := map[string]bool{}
 	values := map[string]string{}
@@ -39,43 +40,44 @@ func loadSiteConfig(path string, flags *flag.FlagSet) error {
 	for dec.More() {
 		key, err := dec.Token()
 		if err != nil {
-			return errors.New("invalid site configuration field")
+			return nil, errors.New("invalid site configuration field")
 		}
 		name, ok := key.(string)
 		if !ok || seen[name] {
-			return errors.New("duplicate site configuration field")
+			return nil, errors.New("duplicate site configuration field")
 		}
 		seen[name] = true
 		switch name {
 		case "version":
 			value, err := dec.Token()
 			if err != nil || value != json.Number("1") {
-				return errors.New("site configuration version must be 1")
+				return nil, errors.New("site configuration version must be 1")
 			}
 		case "flags":
 			if err := readSiteFlags(dec, flags, values, false); err != nil {
-				return err
+				return nil, err
 			}
 		case "private":
 			private, err := readSitePrivate(dec)
 			if err != nil {
-				return err
+				return nil, err
 			}
 			encrypted = private
 
 		default:
-			return fmt.Errorf("unknown site configuration field %q", name)
+			return nil, fmt.Errorf("unknown site configuration field %q", name)
 		}
 	}
 	if token, err := dec.Token(); err != nil || token != json.Delim('}') {
-		return errors.New("invalid site configuration object")
+		return nil, errors.New("invalid site configuration object")
 	}
 	if !seen["version"] || !seen["flags"] {
-		return errors.New("site configuration requires version and flags")
+		return nil, errors.New("site configuration requires version and flags")
 	}
 	if _, err := dec.Token(); err != io.EOF {
-		return errors.New("trailing data in site configuration")
+		return nil, errors.New("trailing data in site configuration")
 	}
+	private := map[string]string{}
 	if encrypted != nil {
 		keyPath := ""
 		if keyFlag := flags.Lookup("config-key-file"); keyFlag != nil {
@@ -83,19 +85,28 @@ func loadSiteConfig(path string, flags *flag.FlagSet) error {
 		}
 		plain, err := openSiteSettings(encrypted, keyPath)
 		if err != nil {
-			return err
+			return nil, err
 		}
 		defer clear(plain)
 		if !utf8.Valid(plain) {
-			return errors.New("encrypted site settings are not UTF-8")
+			return nil, errors.New("encrypted site settings are not UTF-8")
 		}
 		privateDec := json.NewDecoder(bytes.NewReader(plain))
 		privateDec.UseNumber()
+		inClear := make(map[string]bool, len(values))
+		for name := range values {
+			inClear[name] = true
+		}
 		if err := readSiteFlags(privateDec, flags, values, true); err != nil {
-			return err
+			return nil, err
 		}
 		if _, err := privateDec.Token(); err != io.EOF {
-			return errors.New("trailing encrypted site settings")
+			return nil, errors.New("trailing encrypted site settings")
+		}
+		for name, value := range values {
+			if !inClear[name] {
+				private[name] = value
+			}
 		}
 	}
 	explicit := map[string]bool{}
@@ -103,11 +114,11 @@ func loadSiteConfig(path string, flags *flag.FlagSet) error {
 	for name, value := range values {
 		if !explicit[name] {
 			if err := flags.Set(name, value); err != nil {
-				return fmt.Errorf("invalid site configuration flag %q", name)
+				return nil, fmt.Errorf("invalid site configuration flag %q", name)
 			}
 		}
 	}
-	return nil
+	return private, nil
 }
 
 // Both clear and encrypted settings use the same strict parser. Duplicate names

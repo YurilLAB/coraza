@@ -60,6 +60,10 @@ the origin URL, origin HTTP Host, private allowances, trusted peers and certific
 Each save creates an independent random 32-byte key and random nonce. Authentication failure,
 unknown fields, duplicate flags across sections and unsafe key files fail startup.
 
+An error that stops startup or `-check` leaves the encrypted settings out, along with any address
+(the origin's resolved address follows from them): `invalid origin range "[private setting]"`.
+To see the values, give the same settings as flags on the command line.
+
 The default key location is:
 
 | Platform | Key directory |

@@ -15,7 +15,9 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	stdlog "log"
 	"log/slog"
+	"maps"
 	"net"
 	"net/url"
 	"os"
@@ -50,7 +52,13 @@ func run() error {
 	return runArgs(os.Args[1:])
 }
 
+// runArgs runs the proxy, leaving the settings a site file stores encrypted out of whatever error it returns.
 func runArgs(args []string) error {
+	private := map[string]string{}
+	return redactPrivate(runFlags(args, private), private)
+}
+
+func runFlags(args []string, private map[string]string) error {
 	flags := flag.NewFlagSet("carnical", flag.ContinueOnError)
 	flags.SetOutput(os.Stderr)
 	flags.Usage = func() {
@@ -153,9 +161,11 @@ func runArgs(args []string) error {
 		return errors.New("unexpected positional arguments; use named flags")
 	}
 	if *configFile != "" {
-		if err := loadSiteConfig(*configFile, flags); err != nil {
+		encrypted, err := loadSiteConfig(*configFile, flags)
+		if err != nil {
 			return err
 		}
+		maps.Copy(private, encrypted)
 	}
 	if *checkOrigin && !*check {
 		return errors.New("-check-origin requires -check")
@@ -173,8 +183,14 @@ func runArgs(args []string) error {
 		}
 		return probeHealth(*probe, *healthListen)
 	}
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	// A hang-up drains like SIGTERM: there is no configuration to reload. Once the first signal has started the drain, the
+	// handlers are removed, so a second signal ends the process at once instead of waiting out the shutdown budget.
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM, syscall.SIGHUP)
 	defer stop()
+	go func() {
+		<-ctx.Done()
+		stop()
+	}()
 	if *upstream == "" {
 		return errors.New("-upstream is required")
 	}
@@ -256,6 +272,10 @@ func runArgs(args []string) error {
 	if guard != nil {
 		defer guard.Close()
 	}
+	// The reverse proxy's own lines (an application that stops part way through a response body) join the JSON log as
+	// the servers' do, under the name "origin".
+	originErrors := newServerErrors(log.With("server", "origin"), *details)
+	defer originErrors.flush()
 	edge, err := proxy.New(proxy.Config{
 		Upstream: target, Origin: proxy.OriginPolicy{Allow: origin}, OriginTLS: originTLS, UpstreamHost: *upstreamHost, CRS: settings, TrustedProxies: trusted, AllowUpgrade: *allowUpgrade,
 		MaxUpstreamInFlight: *maxUpstream, LogDetails: *details, EvalBudget: *evalBudget, MaxEvaluations: *maxEval, MaxFormBody: *maxForm,
@@ -265,6 +285,7 @@ func runArgs(args []string) error {
 		Uploads:   proxy.UploadPolicy{AllowExecutableNames: *scriptNames, AllowScriptContent: *scriptContent},
 		Responses: proxy.ResponsePolicy{KeepBanners: *keepBanners, KeepCaching: *keepCaching}, MaxConnsPerIP: *maxConns,
 		Inspectors: inspectors, AllowRequestEncoding: *requestEncoding, Shield: guard, CrowdSec: cs,
+		ErrorLog: stdlog.New(originErrors, "", 0),
 		OnMatch: func(m proxy.Match) {
 			attrs := []any{"rule", m.RuleID, "severity", m.Severity, "rule_msg", m.Message, "tx", m.TransactionID, "disruptive", m.Disruptive}
 			if *details {

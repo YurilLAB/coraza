@@ -109,11 +109,17 @@ var addressRe = regexp.MustCompile(`\[[0-9A-Za-z:.%_-]+\](?::\d+)?|[0-9A-Za-z:.%
 
 func redactAddresses(line string) string {
 	return addressRe.ReplaceAllStringFunc(line, func(w string) string {
-		core := strings.TrimRight(w, ":.")
-		_, errPort := netip.ParseAddrPort(core)
-		_, errAddr := netip.ParseAddr(strings.TrimSuffix(strings.TrimPrefix(core, "["), "]"))
-		if errPort == nil || errAddr == nil {
-			return "[address]" + w[len(core):]
+		// An IPv6 address can end in a colon ("2001:db8::"), so a trailing ':' or '.' that belongs to the sentence is set
+		// aside one at a time: the word whole, then without its last character, and so on.
+		for core := w; core != ""; core = core[:len(core)-1] {
+			_, errPort := netip.ParseAddrPort(core)
+			_, errAddr := netip.ParseAddr(strings.TrimSuffix(strings.TrimPrefix(core, "["), "]"))
+			if errPort == nil || errAddr == nil {
+				return "[address]" + w[len(core):]
+			}
+			if last := core[len(core)-1]; last != ':' && last != '.' {
+				break
+			}
 		}
 		return w
 	})

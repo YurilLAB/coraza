@@ -130,7 +130,7 @@ func TestRequestFormatsAtCLI(t *testing.T) {
 				if err := os.WriteFile(path, []byte(tc.data), 0600); err != nil {
 					t.Fatal(err)
 				}
-				err := loadSiteConfig(path, flags)
+				_, err := loadSiteConfig(path, flags)
 				if (err != nil) != tc.bad {
 					t.Fatalf("error %v, want invalid=%v", err, tc.bad)
 				}
@@ -152,12 +152,12 @@ func TestRequestFormatsAtCLI(t *testing.T) {
 				}
 				t.Fatal(err)
 			}
-			if err := loadSiteConfig(link, flag.NewFlagSet("site", flag.ContinueOnError)); err == nil {
+			if _, err := loadSiteConfig(link, flag.NewFlagSet("site", flag.ContinueOnError)); err == nil {
 				t.Fatal("symlink accepted as configuration")
 			}
 		})
 		t.Run("nonregular file", func(t *testing.T) {
-			if err := loadSiteConfig(t.TempDir(), flag.NewFlagSet("site", flag.ContinueOnError)); err == nil {
+			if _, err := loadSiteConfig(t.TempDir(), flag.NewFlagSet("site", flag.ContinueOnError)); err == nil {
 				t.Fatal("directory accepted as config")
 			}
 		})
@@ -306,7 +306,7 @@ func TestRequestFormatsAtCLI(t *testing.T) {
 				if err := flags.Parse([]string{"-upstream=http://override.test", "-config-key-file=" + keyPath}); err != nil {
 					t.Fatal(err)
 				}
-				if err := loadSiteConfig(configPath, flags); err != nil {
+				if _, err := loadSiteConfig(configPath, flags); err != nil {
 					t.Fatal(err)
 				}
 				if flags.Lookup("upstream").Value.String() != "http://override.test" {
@@ -586,6 +586,12 @@ func TestRequestFormatsAtCLI(t *testing.T) {
 				return
 			}
 			requests <- received{string(body), r.Header.Get("Content-Encoding"), r.ContentLength, r.RequestURI}
+		}
+		if r.URL.Path == "/__cli_test_cut" { // an application that dies part way through the body it announced
+			w.Header().Set("Content-Length", "1000")
+			w.Write([]byte("part of a body"))
+			w.(http.Flusher).Flush()
+			panic(http.ErrAbortHandler)
 		}
 		w.WriteHeader(200)
 	}))
@@ -993,6 +999,8 @@ func TestRequestFormatsAtCLI(t *testing.T) {
 		{name: "confine without an upload directory warns that uploads will be refused", extraArgs: []string{"-check", "-confine", "-confine-connect", "$ORIGINPORT,53"}, preflight: true, says: "uploads with file parts will be refused"},
 		{name: "confine refuses an upload directory its group may write", extraArgs: []string{"-check", "-confine", "-confine-connect", "$ORIGINPORT,53", "-upload-dir", "$SHAREDUPLOADS"}, fails: unix, preflight: !unix, says: onUnix("-upload-dir: mode 0770")},
 		{name: "confine check passes with the origin port and an upload directory", extraArgs: []string{"-check", "-confine", "-confine-connect", "$ORIGINPORT,53", "-upload-dir", "$UPLOADS"}, preflight: true},
+		// The reverse proxy's own line about a body the application cut short is JSON, named, without the addresses.
+		{name: "an application that cuts its body short is logged as the origin's error", mode: "block", method: "GET", target: "/__cli_test_cut", status: 0, says: `"server":"origin"`},
 		{name: "site check permits named listening port", extraArgs: []string{"-check", "-listen", "127.0.0.1:http"}, preflight: true},
 		{name: "check validates listen syntax", extraArgs: []string{"-check", "-listen", "invalid"}, fails: true},
 		{name: "check validates upstream port", extraArgs: []string{"-check", "-upstream", "http://127.0.0.1:0"}, fails: true},
@@ -1185,9 +1193,11 @@ func TestRequestFormatsAtCLI(t *testing.T) {
 				t.Cleanup(func() { os.RemoveAll(uploads) })
 				// A Windows temp directory can be named by its 8.3 short name (C:\Users\RUNNER~1\...), whose ~ the setting
 				// refuses; the long name is the same directory in plain characters.
-				if uploads, err = filepath.EvalSymlinks(uploads); err != nil {
+				long, err := filepath.EvalSymlinks(uploads)
+				if err != nil {
 					t.Fatal(err)
 				}
+				uploads = long
 				shared := filepath.Join(uploads, "shared")
 				if err := os.Mkdir(shared, 0o700); err != nil {
 					t.Fatal(err)
@@ -1422,6 +1432,18 @@ func TestRequestFormatsAtCLI(t *testing.T) {
 					req.Header.Set("Content-Encoding", tc.encoding)
 				}
 				resp, err := client.Do(req)
+				if want == 0 { // the connection is closed without an answer: the application died part way through it
+					if err == nil {
+						resp.Body.Close()
+						t.Fatalf("status %d, want the connection closed without an answer", resp.StatusCode)
+					}
+					select {
+					case <-requests:
+					default:
+						t.Fatal("the request did not reach the application")
+					}
+					continue
+				}
 				if err != nil {
 					t.Fatal(err)
 				}
@@ -1499,6 +1521,9 @@ func TestRequestFormatsAtCLI(t *testing.T) {
 			}
 			if tc.logRule != "" && !bytes.Contains(data, []byte(tc.logRule)) {
 				t.Fatalf("expected finding %s absent from logs", tc.logRule)
+			}
+			if tc.says != "" && !bytes.Contains(data, []byte(tc.says)) {
+				t.Fatalf("the log does not say %q:\n%s", tc.says, data)
 			}
 			if tc.logRule != "" {
 				var wanted struct{ Rule int }
@@ -1595,6 +1620,105 @@ func TestFormatStatsLifecycle(t *testing.T) {
 
 // The visitor's key and the CrowdSec bouncer key are read like the origin's: a key others can read is refused, and a FIFO
 // put where the file was expected does not hold start-up.
+// The settings a site file stores encrypted stay out of the errors the proxy prints. Given as flags, the same mistakes name
+// them: that control shows each row would see a leak.
+func TestEncryptedSiteSettingsStayOutOfErrors(t *testing.T) {
+	dir := t.TempDir()
+	keyPath := filepath.Join(dir, "site.key")
+	key := make([]byte, 32)
+	if _, err := cryptorand.Read(key); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeNewSiteFile(keyPath, key); err != nil {
+		t.Fatal(err)
+	}
+	id, err := newSiteKeyID()
+	if err != nil {
+		t.Fatal(err)
+	}
+	hidden := filepath.Join(dir, "hidden-place")
+	for _, tc := range []struct {
+		name     string
+		settings map[string]string
+		extra    []string
+		secrets  []string
+	}{
+		{name: "an upstream that does not parse", settings: map[string]string{"upstream": "http://secret-origin.test:8080/%zz"},
+			secrets: []string{"secret-origin"}},
+		{name: "an origin range that does not parse", settings: map[string]string{"upstream": "http://192.0.2.80:8080", "origin-allow": "192.0.2.0/24,10.99.88.0/33"},
+			secrets: []string{"10.99.88", "192.0.2"}},
+		{name: "a certificate that is not there", settings: map[string]string{"upstream": "http://192.0.2.80:8080", "origin-allow": "192.0.2.0/24",
+			"tls-cert": filepath.Join(hidden, "site-cert.pem"), "tls-key": filepath.Join(hidden, "site-key.pem")}, secrets: []string{"hidden-place", "192.0.2"}},
+		{name: "an origin that refuses the check", settings: map[string]string{"upstream": "http://127.0.0.1:1", "origin-allow": "127.0.0.0/8"},
+			extra: []string{"-check-origin"}, secrets: []string{"127.0.0.1"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			settings := map[string]any{}
+			var asFlags []string
+			for name, value := range tc.settings {
+				settings[name] = value
+				asFlags = append(asFlags, "-"+name, value)
+			}
+			sealed, err := sealSiteSettings(settings, id, key)
+			if err != nil {
+				t.Fatal(err)
+			}
+			data, err := json.Marshal(siteDocument{Version: 1, Flags: map[string]any{}, Private: sealed})
+			if err != nil {
+				t.Fatal(err)
+			}
+			config := filepath.Join(t.TempDir(), "site.json")
+			if err := os.WriteFile(config, data, 0600); err != nil {
+				t.Fatal(err)
+			}
+			named := func(err error) bool {
+				for _, secret := range tc.secrets {
+					if strings.Contains(err.Error(), secret) {
+						return true
+					}
+				}
+				return false
+			}
+			err = runArgs(append([]string{"-config", config, "-config-key-file", keyPath, "-check"}, tc.extra...))
+			if err == nil {
+				t.Fatal("the mistake was not reported")
+			}
+			if named(err) {
+				t.Errorf("the error names an encrypted setting: %v", err)
+			}
+			if err = runArgs(append(append(asFlags, "-check"), tc.extra...)); err == nil || !named(err) {
+				t.Errorf("control: given as flags, the error does not name the setting: %v", err)
+			}
+		})
+	}
+}
+
+func TestPrivateSettingsAreLeftOutOfErrorText(t *testing.T) {
+	private := map[string]string{"upstream": "http://origin:8080/x", "origin-allow": "10.0.0.0/8,10.99.88.0/33",
+		"tls-key": `C:\keys\site.key`, "upstream-host": "shop.example.test"}
+	for _, tc := range []struct{ name, in, want string }{
+		{"a URL in a parse error", `parse "http://origin:8080/x": invalid URL escape "%zz"`, `parse "[private setting]": invalid URL escape "%zz"`},
+		{"one entry of a list", `invalid origin range "10.99.88.0/33"`, `invalid origin range "[private setting]"`},
+		{"a path", `open C:\keys\site.key: not found`, `open [private setting]: not found`},
+		{"an address the origin resolved to", `dial tcp 10.1.2.3:8080: refused`, `dial tcp [address]: refused`},
+		{"a one-word host is replaced only where it can be nothing else", `origin preflight: lookup origin: no such host`,
+			`origin preflight: lookup [private setting]: no such host`},
+		{"a longer name is left alone", `shop.example.testing and shop.example.test.`, `shop.example.testing and [private setting].`},
+		{"nothing private", `-listen must have a valid TCP port`, `-listen must have a valid TCP port`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			err := redactPrivate(errors.New(tc.in), private)
+			if err.Error() != tc.want {
+				t.Fatalf("%q, want %q", err.Error(), tc.want)
+			}
+		})
+	}
+	if err := redactPrivate(fmt.Errorf("at http://origin:8080/x: %w", flag.ErrHelp), private); !errors.Is(err, flag.ErrHelp) ||
+		strings.Contains(err.Error(), "origin:8080") {
+		t.Fatalf("a redacted error no longer unwraps to what it was, or kept the setting: %v", err)
+	}
+}
+
 func TestPrivateFilesAreReadWithCare(t *testing.T) {
 	dir := t.TempDir()
 	write := func(name string, mode os.FileMode) string {
@@ -1754,6 +1878,9 @@ func TestServerErrorsAreLoggedWithoutAddresses(t *testing.T) {
 			"http2: server: error reading preface from client [address]: read tcp [address]->[address]: read: connection reset by peer"},
 		{"an address without a port", false, "http: TLS handshake error from 192.0.2.7:51234: lookup example.com on 2001:db8::53: no such host\n",
 			"http: TLS handshake error from [address]: lookup example.com on [address]: no such host"},
+		{"an IPv6 address that ends in a colon", false, "httputil: ReverseProxy read error during body copy: dial 2001:db8:: refused\n",
+			"httputil: ReverseProxy read error during body copy: dial [address] refused"},
+		{"an IPv6 address that ends a clause", false, "lookup example.com on 2001:db8::: no such host\n", "lookup example.com on [address]: no such host"},
 		{"a line with no address", false, "http: superfluous response.WriteHeader call from main.handler (main.go:12)\n", "http: superfluous response.WriteHeader call from main.handler (main.go:12)"},
 		{"details keep it", true, "http: TLS handshake error from 127.0.0.1:61492: read tcp 127.0.0.1:61491->127.0.0.1:61492: i/o timeout\n",
 			"http: TLS handshake error from 127.0.0.1:61492: read tcp 127.0.0.1:61491->127.0.0.1:61492: i/o timeout"},

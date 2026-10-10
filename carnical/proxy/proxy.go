@@ -16,6 +16,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"mime"
 	"net"
 	"net/http"
@@ -116,6 +117,9 @@ type Config struct {
 	// LogDetails adds the client address, URI, matched data and expanded message to a Match. They hold what the visitor
 	// sent, which can include personal data and credentials, so they are left out unless asked for.
 	LogDetails bool
+	// ErrorLog receives the lines the reverse proxy writes itself, such as an application that stops part way through a
+	// response body. Nil leaves them to the standard logger.
+	ErrorLog *log.Logger
 }
 
 // Match is one rule that matched a request.
@@ -537,6 +541,7 @@ func (e *Edge) forward() http.Handler {
 	transport.MaxIdleConnsPerHost = 64
 	rp := &httputil.ReverseProxy{
 		Transport: transport,
+		ErrorLog:  e.cfg.ErrorLog,
 		Rewrite: func(pr *httputil.ProxyRequest) {
 			in, out := pr.In, pr.Out
 			out.URL.Scheme, out.URL.Host = target.Scheme, target.Host
