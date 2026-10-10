@@ -147,6 +147,15 @@ func NFT(src Source) audit.Check {
 				who.internal = append(who.internal, forms(u))
 			}
 			problems, checked := nftProblems(string(data), who)
+			// The same ruleset as JSON, where nothing is ambiguous, says whether the listing above can be read as it was.
+			checked++
+			if js, err := src.Run(ctx, "nft", "-j", "list", "ruleset"); err != nil {
+				problems = append(problems, "nft could not list the ruleset as JSON, so names and strings that make the listing misread could not be ruled out: "+err.Error())
+			} else if misread, err := nftMisread(js); err != nil {
+				problems = append(problems, "nft's JSON listing could not be read: "+err.Error())
+			} else {
+				problems = append(problems, misread...)
+			}
 			sort.Strings(problems)
 			return audit.Outcome{Checked: checked, Problems: problems}
 		},

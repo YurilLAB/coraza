@@ -2,6 +2,7 @@ package host
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io/fs"
@@ -346,13 +347,15 @@ func readLF(t *testing.T, parts ...string) string {
 func TestNFT(t *testing.T) {
 	needLinux(t)
 	good := readLF(t, "testdata", "nft-ruleset.txt")
+	goodJSON := readLF(t, "testdata", "nft-ruleset.json") // what nft -j prints for the same ruleset
 	passwd := "root:x:0:0::/root:/bin/sh\ncarnical-edge:x:990:990::/:/usr/sbin/nologin\n"
 	for i, u := range InternalUsers {
 		passwd += fmt.Sprintf("%s:x:%d:%d::/:/usr/sbin/nologin\n", u, 991+i, 991+i)
 	}
-	m := func(s string) *fake {
-		return &fake{files: map[string]string{"/etc/passwd": passwd}, runs: map[string]string{"nft list ruleset": s}}
+	both := func(s, js string) *fake {
+		return &fake{files: map[string]string{"/etc/passwd": passwd}, runs: map[string]string{"nft list ruleset": s, "nft -j list ruleset": js}}
 	}
+	m := func(s string) *fake { return both(s, goodJSON) }
 	edit := func(t *testing.T, old, new string) string {
 		t.Helper()
 		if n := strings.Count(good, old); n != 1 {
@@ -379,7 +382,9 @@ func TestNFT(t *testing.T) {
 		{"the edge's user by name", edgeJump, "\t\tmeta skuid \"carnical-edge\" jump edge_out\n"},
 		{"another table beside it", "table inet carnical {\n", "table ip other {\n\tchain input {\n\t\ttype filter hook input priority filter; policy accept;\n\t\taccept\n\t}\n}\ntable inet carnical {\n"},
 		{"the site's own resolver", edgeStart + "\t\tip daddr { 127.0.0.53, 127.0.0.54 } udp dport 53 accept\n", edgeStart + "\t\tip daddr 10.0.0.2 udp dport 53 counter accept\n"},
-		{"a verdict map after the blocks", "tcp dport { 80, 443 } accept", "tcp dport vmap { 80 : accept, 443 : accept }"},
+		{"another named port after the blocks", "tcp dport { 80, 443 } accept", "tcp dport { 80, 443, 8443 } accept"},
+		{"named origins after the blocks", "\t\ttcp dport { 80, 443 } accept\n", "\t\tip daddr { 192.0.2.10, 198.51.100.0/24 } tcp dport 443 ct state new counter accept\n\t\tip6 daddr @origins6 tcp dport 443 accept\n"},
+		{"a log line after the blocks", "\t\ttcp dport { 80, 443 } accept\n", "\t\ttcp dport { 80, 443 } accept\n\t\tlimit rate 5/minute log prefix \"carnical-edge-egress \"\n"},
 		{"an accept after input's last jump, which no packet reaches", "\t\tcounter name \"input_denied\" jump input_drop\n", "\t\tcounter name \"input_denied\" jump input_drop\n\t\taccept\n"},
 		{"an accept after a drop, which no packet reaches", "level info\n\t\tdrop\n", "level info\n\t\tdrop\n\t\taccept\n"},
 		{"replies accepted with a counter", "\tchain output {\n\t\ttype filter hook output priority filter; policy accept;\n\t\tct state established,related accept\n",
@@ -448,6 +453,14 @@ func TestNFT(t *testing.T) {
 		{"the private block narrowed to one port", privateBlock, `ip daddr @not_public4 tcp dport 22 counter name "egress_private_drop" jump edge_private_drop`, "block on private IPv4 destinations does not cover"},
 		{"the private block on the source", privateBlock, `ip saddr @not_public4 counter name "egress_private_drop" jump edge_private_drop`, "block on private IPv4 destinations does not cover"},
 		{"the edge's chain does not end in a drop", "\t\tcounter name \"egress_edge_drop\" jump edge_egress_drop\n", "", "edge's chain does not end"},
+		{"a verdict map after the blocks", "tcp dport { 80, 443 } accept", "tcp dport vmap { 80 : accept, 443 : accept }", "after the edge's blocks"},
+		{"every connection accepted after the blocks", "\t\ttcp dport { 80, 443 } accept\n", "\t\ttcp dport { 80, 443 } accept\n\t\tcounter accept\n", `after the edge's blocks lets connections out in a way this check does not recognise: "counter accept"`},
+		{"a return after the blocks", "\t\ttcp dport { 80, 443 } accept\n", "\t\treturn\n", "after the edge's blocks"},
+		{"a range of ports after the blocks", "tcp dport { 80, 443 } accept", "tcp dport 1-65535 accept", "after the edge's blocks"},
+		{"every port to one address after the blocks", "\t\ttcp dport { 80, 443 } accept\n", "\t\tip daddr 192.0.2.10 accept\n", "after the edge's blocks"},
+		{"every address but one after the blocks", "\t\ttcp dport { 80, 443 } accept\n", "\t\tip daddr != 192.0.2.10 tcp dport 25 accept\n", "after the edge's blocks"},
+		{"a jump after the blocks to a chain that accepts", "\t\ttcp dport { 80, 443 } accept\n", "\t\tjump echo_guard\n", "after the edge's blocks"},
+		{"an inline chain after the blocks", "\t\ttcp dport { 80, 443 } accept\n", "\t\tjump {\n" + inline, "after the edge's blocks"},
 		{"the internal chain does not end in a drop", "\t\tcounter name \"egress_internal_drop\" jump internal_egress_drop\n", "", "internal services' chain does not end"},
 		{"the metadata service accepted", `ip daddr 169.254.169.254 meta skuid != 0 counter name "egress_imds_drop" jump imds_drop`, "ip daddr 169.254.169.254 accept", "metadata service"},
 		{"the IPv6 metadata service accepted", `ip6 daddr fd00:ec2::254 meta skuid != 0 counter name "egress_imds_drop" jump imds_drop`, "ip6 daddr fd00:ec2::254 accept", "metadata service (fd00:ec2::254)"},
@@ -479,6 +492,70 @@ func TestNFT(t *testing.T) {
 	if r := run(NFT(m(""))); r.Status != audit.Fail {
 		t.Fatalf("nothing loaded: %+v", r)
 	}
+
+	// nft lists names and strings as they are, so the listing is read only when nft -j shows none that could be misread.
+	withJSON := func(objects ...string) string {
+		return strings.Replace(goodJSON, `{"nftables": [`, `{"nftables": [`+strings.Join(objects, ", ")+", ", 1)
+	}
+	edgeRule := func(fields string) string {
+		return `{"rule": {"family": "inet", "table": "carnical", "chain": "edge_out", "handle": 91, ` + fields + `}}`
+	}
+	for _, tt := range []struct{ name, js string }{
+		{"a comment with spaces, braces and another script", withJSON(edgeRule(`"comment": "public {80, 443} only, édge", "expr": [{"accept": null}]`))},
+		{"names with dashes, dots and slashes", withJSON(`{"chain": {"family": "inet", "table": "carnical", "name": "service-ULMVA6XW-default/kubernetes/tcp/https", "handle": 90}}`,
+			`{"set": {"family": "inet", "name": "kube.cluster-ips", "table": "carnical", "type": "ipv4_addr", "handle": 92}}`)},
+	} {
+		t.Run("passes: "+tt.name, func(t *testing.T) {
+			if r := run(NFT(both(good, tt.js))); r.Status != audit.Pass {
+				t.Fatalf("%+v", r)
+			}
+		})
+	}
+	long := strings.Repeat("a", 70)
+	for _, tt := range []struct{ name, js, says string }{
+		{"a chain named with a space", withJSON(`{"chain": {"family": "inet", "table": "carnical", "name": "x drop", "handle": 90}}`), `name with a space, quote, brace, comma, semicolon, # or control character, which nft lists as it is, so the listing can be misread: "x drop"`},
+		{"a jump to a name with a brace", withJSON(edgeRule(`"expr": [{"jump": {"target": "b}c"}}]`)), `misread: "b}c"`},
+		{"a table named with #", withJSON(`{"table": {"family": "ip", "name": "t#1", "handle": 9}}`), `misread: "t#1"`},
+		{"a device list with a comma", withJSON(`{"flowtable": {"family": "inet", "name": "f", "table": "carnical", "hook": "ingress", "prio": 0, "dev": ["eth0", "a,b"]}}`), `misread: "a,b"`},
+		{"a comment with a quote", withJSON(edgeRule(`"comment": "q\"} accept", "expr": [{"accept": null}]`)), `string with a quote or control character, which nft lists as it is, so the listing can be misread: "q\"} accept"`},
+		{"a comment with a line break", withJSON(edgeRule(`"comment": "line\nbreak", "expr": [{"accept": null}]`)), `misread: "line\nbreak"`},
+		{"a log prefix with a quote", withJSON(edgeRule(`"expr": [{"log": {"prefix": "p\" drop"}}, {"accept": null}]`)), `misread: "p\" drop"`},
+		{"an interface name with a quote", withJSON(edgeRule(`"expr": [{"match": {"op": "==", "left": {"meta": {"key": "iifname"}}, "right": "e\"} x"}}, {"accept": null}]`)), `misread: "e\"} x"`},
+		{"a long comment, cut", withJSON(edgeRule(`"comment": "` + long + `\"", "expr": [{"accept": null}]`)), `misread: "` + long[:64] + `..."`},
+		{"nft prints something that is not JSON", "nftables: {", "JSON listing could not be read"},
+	} {
+		t.Run("fails: "+tt.name, func(t *testing.T) {
+			r := run(NFT(both(good, tt.js)))
+			if r.Status != audit.Fail || !strings.Contains(strings.Join(r.Problems, "\n"), tt.says) {
+				t.Fatalf("want a failure saying %q: %+v", tt.says, r)
+			}
+		})
+	}
+	t.Run("fails: nft cannot list as JSON", func(t *testing.T) {
+		f := m(good)
+		delete(f.runs, "nft -j list ruleset")
+		if r := run(NFT(f)); r.Status != audit.Fail || !strings.Contains(strings.Join(r.Problems, "\n"), "could not list the ruleset as JSON") {
+			t.Fatalf("%+v", r)
+		}
+	})
+	// A chain named "x drop" lists as `jump x drop`, which reads as a drop that ends input's checks before an accept.
+	t.Run("fails: a chain named like a drop, as nft really lists it", func(t *testing.T) {
+		listing := strings.Replace(edit(t, inputStart, inputStart+"\t\tjump x drop\n\t\taccept\n"), edgeStart, "\tchain x drop {\n\t\taccept\n\t}\n\n"+edgeStart, 1)
+		js := withJSON(`{"chain": {"family": "inet", "table": "carnical", "name": "x drop", "handle": 90}}`,
+			`{"rule": {"family": "inet", "table": "carnical", "chain": "input", "handle": 93, "expr": [{"jump": {"target": "x drop"}}]}}`)
+		if r := run(NFT(both(listing, js))); r.Status != audit.Fail || !strings.Contains(strings.Join(r.Problems, "\n"), `misread: "x drop"`) {
+			t.Fatalf("%+v", r)
+		}
+	})
+	t.Run("at most ten names are reported", func(t *testing.T) {
+		var chains []string
+		for i := range 12 {
+			chains = append(chains, fmt.Sprintf(`{"chain": {"family": "inet", "table": "carnical", "name": "x %d", "handle": %d}}`, i, 100+i))
+		}
+		if r := run(NFT(both(good, withJSON(chains...)))); r.Status != audit.Fail || len(r.Problems) != 10 {
+			t.Fatalf("want ten problems: %+v", r)
+		}
+	})
 }
 
 // TestNFTListingMatchesTheRulesetFile keeps the listing above, and the ranges the check asks for, tied to the shipped file.
@@ -495,6 +572,26 @@ func TestNFTListingMatchesTheRulesetFile(t *testing.T) {
 		l := listing.chains[name]
 		if l == nil || len(l.rules) != len(c.rules) || l.hook != c.hook || l.policy != c.policy {
 			t.Errorf("chain %s differs between the ruleset file and the listing: regenerate the listing", name)
+		}
+	}
+	// The JSON listing is of the same ruleset: the same rules in the same chains.
+	var js struct {
+		Nftables []struct {
+			Rule *struct{ Table, Chain string }
+		}
+	}
+	if err := json.Unmarshal([]byte(readLF(t, "testdata", "nft-ruleset.json")), &js); err != nil {
+		t.Fatal(err)
+	}
+	rules := map[string]int{}
+	for _, o := range js.Nftables {
+		if o.Rule != nil && o.Rule.Table == "carnical" {
+			rules[o.Rule.Chain]++
+		}
+	}
+	for name, c := range listing.chains {
+		if rules[name] != len(c.rules) {
+			t.Errorf("chain %s has %d rules in the JSON listing and %d in the listing: regenerate both", name, rules[name], len(c.rules))
 		}
 	}
 	internal := nftUsers{}

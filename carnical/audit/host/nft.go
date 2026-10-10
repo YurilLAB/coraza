@@ -2,12 +2,15 @@ package host
 
 import (
 	"bufio"
+	"encoding/json"
 	"fmt"
+	"maps"
 	"net/netip"
 	"regexp"
 	"slices"
 	"strconv"
 	"strings"
+	"unicode"
 )
 
 // The network policy is checked by what its chains do, not by whether its words appear: a chain whose policy was changed
@@ -226,6 +229,60 @@ func fields(rule string) []string {
 	return out
 }
 
+// nftNameKeys are the keys of `nft -j` whose strings nft lists as they are, without quotes: names, and what refers to them.
+var nftNameKeys = map[string]bool{"name": true, "target": true, "table": true, "chain": true, "dev": true, "devices": true}
+
+// nftMisread lists the names and strings in `nft -j list ruleset` that the text listing cannot show unambiguously. nft
+// escapes nothing when it lists a ruleset (nftables 1.1.3): a comment written through JSON as `q"} accept` is listed as
+// comment "q"} accept", and a chain named `x drop` as `jump x drop`, which reads as a drop. The text listing is what the
+// check reads, so it is trusted only when no name holds a space, quote, brace, comma, semicolon, # or control character,
+// and no string a quote or control character. Every table is looked at, not only carnical's: a line break in another
+// table's string could hold lines that close it and open a table inet carnical of its own, ahead of the real one.
+func nftMisread(data []byte) ([]string, error) {
+	var v any
+	if err := json.Unmarshal(data, &v); err != nil {
+		return nil, err
+	}
+	var out []string
+	seen := map[string]bool{}
+	report := func(what, s string) {
+		if r := []rune(s); len(r) > 64 {
+			s = string(r[:64]) + "..."
+		}
+		if msg := fmt.Sprintf("the ruleset has a %s, which nft lists as it is, so the listing can be misread: %q", what, s); !seen[msg] && len(out) < 10 {
+			seen[msg] = true
+			out = append(out, msg)
+		}
+	}
+	var visit func(key string, v any)
+	visit = func(key string, v any) {
+		switch v := v.(type) {
+		case map[string]any:
+			for _, k := range slices.Sorted(maps.Keys(v)) {
+				visit(k, v[k])
+			}
+		case []any:
+			if !nftNameKeys[key] {
+				key = ""
+			}
+			for _, item := range v {
+				visit(key, item)
+			}
+		case string:
+			switch {
+			case nftNameKeys[key] && strings.ContainsFunc(v, func(r rune) bool {
+				return unicode.IsSpace(r) || unicode.IsControl(r) || strings.ContainsRune(`"{},;#`, r)
+			}):
+				report("name with a space, quote, brace, comma, semicolon, # or control character", v)
+			case strings.ContainsFunc(v, func(r rune) bool { return r == '"' || unicode.IsControl(r) }):
+				report("string with a quote or control character", v)
+			}
+		}
+	}
+	visit("", v)
+	return out, nil
+}
+
 var nftVerdicts = map[string]bool{"accept": true, "drop": true, "reject": true, "return": true, "jump": true, "goto": true, "continue": true, "queue": true}
 
 // verdict is what a rule does with a packet it matches, and the chain it sends it to for jump and goto. A rule with no
@@ -312,6 +369,9 @@ var (
 	localBlock    = form(`fib daddr type local`)
 	// resolver is a name lookup to named hosts, which comes before the blocks: single addresses, not ranges or sets.
 	resolver = form(`ip6? daddr ` + oneOrSet(`[0-9A-Fa-f:.]+`) + ` (?:udp|tcp) dport 53`)
+	// edgeAccepts is what the edge may connect to after its blocks, where only public destinations are left: named ports, to
+	// any of them or to named addresses.
+	edgeAccepts = form(`(?:ip6? daddr (?:@\w+|\{[^{}]+\}|[0-9A-Fa-f:./]+) )?(?:tcp|udp) dport ` + oneOrSet(`\d+`) + `(?: ct state new)?`)
 	// localResolver is the same on this machine only: the internal services may reach nothing else.
 	localResolver = form(`ip6? daddr ` + oneOrSet(`127(?:\.\d{1,3}){3}|::1`) + ` (?:udp|tcp) dport 53`)
 	loopback      = form(`oif(?:name)? "lo"`)
@@ -584,8 +644,17 @@ func nftProblems(text string, users nftUsers) (out []string, checked int) {
 			}
 			add("a rule ahead of the edge's blocks can let traffic past them: %q", r)
 		}
-		if n := len(edge.rules); n == 0 || !t.endsInDrop(edge.rules[n-1]) {
+		n := len(edge.rules)
+		if n == 0 || !t.endsInDrop(edge.rules[n-1]) {
 			add("the edge's chain does not end by refusing what it has not allowed")
+		}
+		// After the blocks the edge may reach public addresses on named ports, and nothing else before the final drop.
+		for i := last + 1; last >= 0 && i < n-1; i++ {
+			kind, _, before := verdict(edge.rules[i])
+			if kind == "" || t.drops(edge.rules[i]) || kind == "accept" && edgeAccepts.MatchString(conditions(before)) {
+				continue
+			}
+			add("a rule after the edge's blocks lets connections out in a way this check does not recognise: %q", edge.rules[i])
 		}
 	}
 	if internal := t.chains["internal_out"]; internal == nil {
