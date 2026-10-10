@@ -14,6 +14,7 @@ import (
 	"io/fs"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
 )
 
@@ -110,6 +111,9 @@ type Settings struct {
 	// DisableLocalRules omits Carnical's supplemental injection rules. They are separate from the verified, unmodified CRS
 	// release, run at PL1 and add five inbound anomaly points per finding. Mode and thresholds apply to both rule sets.
 	DisableLocalRules bool
+	// LocalRulesOff switches single local rules off by id, for a site whose ordinary traffic one of them refuses (an
+	// admin reaching its own diagnostic page, say). At most 32 ids, each a local rule's.
+	LocalRulesOff []int
 }
 
 // DefaultSettings blocks at paranoia level 1 with the standard thresholds.
@@ -169,6 +173,14 @@ func (s Settings) Validate() error {
 	if len(s.AllowedMethods) > 20 {
 		return fmt.Errorf("more than 20 allowed methods")
 	}
+	if len(s.LocalRulesOff) > 32 {
+		return fmt.Errorf("more than 32 local rules switched off")
+	}
+	for _, id := range s.LocalRulesOff {
+		if LocalRuleMessage(id) == "" {
+			return fmt.Errorf("%d is not a local rule id", id)
+		}
+	}
 	return nil
 }
 
@@ -226,6 +238,13 @@ func (s Settings) Directives() (string, error) {
 			initialized = true
 			if !s.DisableLocalRules {
 				line("Include local/*.conf")
+				if len(s.LocalRulesOff) > 0 {
+					ids := make([]string, len(s.LocalRulesOff))
+					for i, id := range s.LocalRulesOff {
+						ids[i] = strconv.Itoa(id)
+					}
+					line("SecRuleRemoveById %s", strings.Join(ids, " "))
+				}
 			}
 		}
 	}

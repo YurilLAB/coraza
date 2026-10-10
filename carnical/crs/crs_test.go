@@ -12,6 +12,7 @@ import (
 	"net/url"
 	"os"
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -120,6 +121,9 @@ func TestSettingsAreValidated(t *testing.T) {
 		"lower-case method":        func(s *crs.Settings) { s.AllowedMethods = []string{"get"} },
 		"method with a space":      func(s *crs.Settings) { s.AllowedMethods = []string{"GET HEAD"} },
 		"method with a quote":      func(s *crs.Settings) { s.AllowedMethods = []string{`GET"`} },
+		"a CRS rule as local":      func(s *crs.Settings) { s.LocalRulesOff = []int{942100} },
+		"an unknown local rule":    func(s *crs.Settings) { s.LocalRulesOff = []int{5006012, 5006999} },
+		"33 local rules off":       func(s *crs.Settings) { s.LocalRulesOff = slices.Repeat([]int{5006012}, 33) },
 	} {
 		s := good
 		change(&s)
@@ -138,6 +142,9 @@ func TestSettingsAreValidated(t *testing.T) {
 		"off":           func(s *crs.Settings) { s.Mode = crs.ModeOff },
 		"stricter":      func(s *crs.Settings) { s.InboundThreshold = 3 },
 		"bigger bodies": func(s *crs.Settings) { s.RequestBodyLimit = 8 << 20 },
+		"32 local rules off": func(s *crs.Settings) {
+			s.LocalRulesOff = append(slices.Repeat([]int{5006012}, 31), 5006001)
+		},
 	} {
 		s := good
 		change(&s)
@@ -287,6 +294,43 @@ func TestTheRuleSetBlocksCommonAttacksAndPassesOrdinaryTraffic(t *testing.T) {
 		"Slider Revolution update folder":      {"GET", "/wp-content/plugins/revslider/temp/update_extract/revslider/x.php", "", "", nil, 403},
 		"web shell by name":                    {"GET", "/images/c99.php", "", "", nil, 403},
 		"web shell with a query":               {"GET", "/wso.php?cmd=x", "", "", nil, 403},
+		"Laravel Ignition solution":            {"POST", "/_ignition/execute-solution", "application/json", `{"solution":"x"}`, nil, 403},
+		"Spring actuator environment":          {"GET", "/actuator/env", "", "", nil, 403},
+		"actuator heap dump":                   {"GET", "/manage/actuator/heapdump", "", "", nil, 403},
+		"actuator behind a path parameter":     {"GET", "/actuator;a=b/configprops", "", "", nil, 403},
+		"encoded actuator name":                {"GET", "/actuator/%65nv", "", "", nil, 403},
+		"Jolokia":                              {"GET", "/jolokia/list", "", "", nil, 403},
+		"Go profiler":                          {"GET", "/debug/pprof/heap", "", "", nil, 403},
+		"Go expvar":                            {"GET", "/debug/vars", "", "", nil, 403},
+		"Apache server-status":                 {"GET", "/server-status?auto", "", "", nil, 403},
+		"Symfony profiler":                     {"GET", "/_profiler/phpinfo", "", "", nil, 403},
+		"Yii debug panel":                      {"GET", "/debug/default/view?panel=config", "", "", nil, 403},
+		"WordPress installer":                  {"GET", "/wp-admin/install.php?step=1", "", "", nil, 403},
+		"WordPress setup-config":               {"POST", "/wp-admin/setup-config.php?step=2", form, "dbname=x", nil, 403},
+		"WordPress installer in a subfolder":   {"GET", "/blog/WP-ADMIN/install.php", "", "", nil, 403},
+		"Joomla installer":                     {"GET", "/installation/index.php", "", "", nil, 403},
+		"Drupal installer":                     {"GET", "/core/install.php?profile=standard", "", "", nil, 403},
+		"dirsearch":                            {"GET", "/", "", "", map[string]string{"User-Agent": "dirsearch/0.4.3"}, 403},
+		"jaeles":                               {"GET", "/", "", "", map[string]string{"User-Agent": "Jaeles - Automated Web Application Security Testing"}, 403},
+		"remote include in page":               {"GET", "/index.php?page=" + url.QueryEscape("http://evil.example/shell.php"), "", "", nil, 403},
+		"remote include in a nested key":       {"GET", "/index.php?" + url.QueryEscape("template[0]") + "=" + url.QueryEscape("https://evil.example/x"), "", "", nil, 403},
+		"remote include in a dotted key":       {"POST", "/api", "application/json", `{"settings":{"module":"https://evil.example/m"}}`, nil, 403},
+		"remote include in a JSON array":       {"POST", "/api", "application/json", `{"page":["http://evil.example/shell.php"]}`, nil, 403},
+		"remote include in a nested array":     {"POST", "/api", "application/json", `{"a":{"template":[{"x":1},"https://evil.example/m"]}}`, nil, 403},
+		"remote include in capitals":           {"GET", "/index.php?FILE=" + url.QueryEscape("HTTP://EVIL.EXAMPLE/X"), "", "", nil, 403},
+		"remote include without a scheme":      {"GET", "/index.php?inc=" + url.QueryEscape("//evil.example/x"), "", "", nil, 403},
+		"remote include with a port":           {"GET", "/index.php?path=" + url.QueryEscape("http://evil.example:8080/x"), "", "", nil, 403},
+		"remote include to an address":         {"GET", "/index.php?page=" + url.QueryEscape("http://[2001:db8::1]/x"), "", "", nil, 403},
+		"remote include with userinfo":         {"GET", "/index.php?page=" + url.QueryEscape("http://shop.example.test@evil.example/x"), "", "", nil, 403},
+		"remote include after a local one":     {"GET", "/index.php?page=" + url.QueryEscape("http://shop.example.test/a") + "&page=" + url.QueryEscape("http://evil.example/b"), "", "", nil, 403},
+		"remote include before a local one":    {"GET", "/index.php?page=" + url.QueryEscape("http://evil.example/b") + "&page=" + url.QueryEscape("http://shop.example.test/a"), "", "", nil, 403},
+		"look-alike suffix host":               {"GET", "/index.php?page=" + url.QueryEscape("http://evilshop.example.test/x"), "", "", nil, 403},
+		"FTP address in any field":             {"GET", "/x?u=" + url.QueryEscape("ftp://evil.example/x"), "", "", nil, 403},
+		"SMB address in any field":             {"GET", "/x?u=" + url.QueryEscape(`\\evil.example\share\x`), "", "", nil, 403},
+		"SSH2 wrapper in any field":            {"GET", "/x?u=" + url.QueryEscape("ssh2.exec://evil.example/id"), "", "", nil, 403},
+		"scheme-less host in any field":        {"GET", "/x?u=" + url.QueryEscape("//evil.example/x"), "", "", nil, 403},
+		"remote text file in any field":        {"GET", "/x?u=" + url.QueryEscape("http://evil.example/shell.txt"), "", "", nil, 403},
+		"remote include file in a JSON body":   {"POST", "/api", "application/json", `{"u":"https://evil.example/a/b.inc?x=1"}`, nil, 403},
 		// No XXE case: the CRS has no rule for external entities. Block them in the XML parser or with a rule of our own.
 		"XPath in an XML attribute":    {"POST", "/api", "application/xml", `<input value="' or true() or 'a'='b"/>`, nil, 403},
 		"benign XML attribute":         {"POST", "/api", "application/xml", `<input value="O'Brien"/>`, nil, 200},
@@ -310,6 +354,25 @@ func TestTheRuleSetBlocksCommonAttacksAndPassesOrdinaryTraffic(t *testing.T) {
 		"a WordPress admin page":       {"GET", "/wp-admin/admin-ajax.php?action=heartbeat", "", "", nil, 200},
 		"a page named like a shell":    {"GET", "/reviews/c99-phone", "", "", nil, 200},
 		"a PHPUnit documentation page": {"GET", "/docs/phpunit/eval-stdin", "", "", nil, 200},
+		"actuator health":              {"GET", "/actuator/health", "", "", nil, 200},
+		"actuator info":                {"GET", "/actuator/info", "", "", nil, 200},
+		"a page about server status":   {"GET", "/blog/server-status-page", "", "", nil, 200},
+		"a guide to pprof":             {"GET", "/docs/debug/pprof-guide", "", "", nil, 200},
+		"an install guide":             {"GET", "/wp-admin/install-guide", "", "", nil, 200},
+		"a Joomla installation guide":  {"GET", "/installation/guide.html", "", "", nil, 200},
+		"a page slug":                  {"GET", "/wp-admin/admin.php?page=wpseo_dashboard", "", "", nil, 200},
+		"a local file in page":         {"GET", "/index.php?file=" + url.QueryEscape("reports/2024/q1.pdf"), "", "", nil, 200},
+		"this site in page":            {"GET", "/index.php?page=" + url.QueryEscape("https://shop.example.test/about"), "", "", nil, 200},
+		"a subdomain in page":          {"GET", "/index.php?page=" + url.QueryEscape("https://cdn.shop.example.test/a.css"), "", "", nil, 200},
+		"this site twice in page":      {"GET", "/index.php?page=" + url.QueryEscape("https://shop.example.test/a") + "&page=" + url.QueryEscape("//shop.example.test/b"), "", "", nil, 200},
+		"a Windows path in dir":        {"GET", "/x?dir=" + url.QueryEscape(`C:\Users\alice`), "", "", nil, 200},
+		"another site in a link field": {"GET", "/matomo.php?url=" + url.QueryEscape("https://shop.example.test/x") + "&urlref=" + url.QueryEscape("https://www.google.com/search?q=widgets"), "", "", nil, 200},
+		"a PHP page as a referrer":     {"GET", "/track?ref=" + url.QueryEscape("https://forum.example.org/viewtopic.php?t=1"), "", "", nil, 200},
+		"a code comment":               {"POST", "/snippets", form, "code=" + url.QueryEscape("// todo.fix later"), nil, 200},
+		"this site in a JSON array":    {"POST", "/api", "application/json", `{"page":["https://shop.example.test/a","https://cdn.shop.example.test/b"]}`, nil, 200},
+		"paths in a JSON array":        {"POST", "/api", "application/json", `{"files":["a/b.txt","c.pdf"],"page":[1,2]}`, nil, 200},
+		"a text file on this site":     {"GET", "/x?u=" + url.QueryEscape("https://shop.example.test/robots.txt"), "", "", nil, 200},
+		"a text file mentioned":        {"GET", "/x?q=" + url.QueryEscape("see http://example.org/notes.txt for details"), "", "", nil, 200},
 	} {
 		t.Run(name, func(t *testing.T) {
 			if got := do(t, srv, tc.method, tc.target, tc.ct, tc.body, tc.headers); got != tc.want {
@@ -450,5 +513,77 @@ func TestExclusionsCanBeAddedBeforeTheRules(t *testing.T) {
 	}
 	if got := do(t, srv, "POST", "/editor/save", html, "id="+url.QueryEscape("1' OR '1'='1' --"), nil); got != 403 {
 		t.Errorf("the exclusion removed more than the XSS rules: %d, want 403", got)
+	}
+}
+
+// The CRS blocks several of these requests too (a remote include is also a path traversal, a scheme, a PHP wrapper). With its
+// detection rules removed (911000 to 948999; the scoring and the blocking decision stay) what refuses a request is a local rule
+// alone, so a weakening of one of them cannot hide behind the CRS.
+func TestLocalRulesRefuseOnTheirOwn(t *testing.T) {
+	s := crs.DefaultSettings()
+	s.After = "SecRuleRemoveById 911000-948999"
+	srv, _ := serve(t, s)
+	if got := do(t, srv, "GET", "/search?q="+url.QueryEscape("1' OR '1'='1' --"), "", "", nil); got != 200 {
+		t.Fatalf("an attack only a CRS rule recognises: %d, want 200 (the CRS rules were not removed)", got)
+	}
+	inc := func(name, value string) string { return "/index.php?" + name + "=" + url.QueryEscape(value) }
+	for name, tc := range map[string]struct {
+		target  string
+		headers map[string]string
+		want    int
+	}{
+		"debug interface":              {"/actuator/heapdump", nil, 403},
+		"installer":                    {"/wp-admin/setup-config.php", nil, 403},
+		"scanner":                      {"/", map[string]string{"User-Agent": "dirsearch/0.4.3"}, 403},
+		"include with a host name":     {inc("page", "http://evil.example/x"), nil, 403},
+		"include with an IPv6 host":    {inc("page", "http://[2001:db8::1]/x"), nil, 403},
+		"include with a bare IPv6":     {inc("file", "//[2001:db8::1]/x"), nil, 403},
+		"include with a plain scheme":  {inc("template", "gopher://evil.example/x"), nil, 403},
+		"include behind userinfo":      {inc("page", "http://shop.example.test@evil.example/x"), nil, 403},
+		"Jolokia":                      {"/jolokia/list", nil, 403},
+		"Joomla installer":             {"/installation/index.php", nil, 403},
+		"Drupal installer":             {"/core/install.php", nil, 403},
+		"FTP address":                  {"/x?u=" + url.QueryEscape("ftp://evil.example/x"), nil, 403},
+		"FTPS address":                 {"/x?u=" + url.QueryEscape("ftps://evil.example/x"), nil, 403},
+		"bare IPv6 in any field":       {"/x?u=" + url.QueryEscape("//[2001:db8::1]/x"), nil, 403},
+		"SMB path":                     {"/x?u=" + url.QueryEscape(`\\evil.example\share`), nil, 403},
+		"SSH2 wrapper":                 {"/x?u=" + url.QueryEscape("ssh2.exec://evil.example/id"), nil, 403},
+		"SSH2 SFTP wrapper":            {"/x?u=" + url.QueryEscape("ssh2.sftp://evil.example/id"), nil, 403},
+		"scheme-less host":             {"/x?u=" + url.QueryEscape("//evil.example/x"), nil, 403},
+		"remote text file":             {"/x?u=" + url.QueryEscape("http://evil.example/shell.txt"), nil, 403},
+		"remote include file":          {"/x?u=" + url.QueryEscape("https://evil.example/lib.inc?x=1"), nil, 403},
+		"include with a bracket index": {inc("page[0]", "http://evil.example/x"), nil, 403},
+		"this site in page":            {inc("page", "https://shop.example.test/about"), nil, 200},
+		"this site in a text file":     {"/x?u=" + url.QueryEscape("https://shop.example.test/robots.txt"), nil, 200},
+		"a subdomain of this site":     {"/x?u=" + url.QueryEscape("ftp://files.shop.example.test/x"), nil, 200},
+		"a page on another site":       {"/x?u=" + url.QueryEscape("https://www.example.org/page.html"), nil, 200},
+		"a path":                       {inc("page", "reports/2024/q1"), nil, 200},
+	} {
+		t.Run(name, func(t *testing.T) {
+			if got := do(t, srv, "GET", tc.target, "", "", tc.headers); got != tc.want {
+				t.Errorf("status %d, want %d", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestSingleLocalRulesCanBeSwitchedOff(t *testing.T) {
+	s := crs.DefaultSettings()
+	s.LocalRulesOff = []int{5006012, 5006015}
+	srv, _ := serve(t, s)
+	for name, tc := range map[string]struct {
+		target string
+		want   int
+	}{
+		"a rule switched off":                {"/actuator/env", 200},
+		"a chained rule switched off":        {"/index.php?page=" + url.QueryEscape("https://evil.example/x"), 200},
+		"a rule left on":                     {"/wp-admin/install.php", 403},
+		"another rule on the same parameter": {"/index.php?page=" + url.QueryEscape("ftp://evil.example/x"), 403},
+	} {
+		t.Run(name, func(t *testing.T) {
+			if got := do(t, srv, "GET", tc.target, "", "", nil); got != tc.want {
+				t.Errorf("status %d, want %d", got, tc.want)
+			}
+		})
 	}
 }

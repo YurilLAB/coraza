@@ -764,12 +764,16 @@ func TestApplyToSetsOnlyWhatThePolicyDecides(t *testing.T) {
 	}
 	cfg := proxy.Config{MaxUpstreamInFlight: 7, EvalBudget: 3 * time.Second, UpstreamHost: "origin.internal", MaxConnsPerIP: 9, AllowUpgrade: true, LogDetails: true}
 	cfg.CRS.UploadDir = "/var/lib/carnical/uploads"
+	cfg.CRS.DisableLocalRules, cfg.CRS.LocalRulesOff = true, []int{5006012}
 	c.ApplyTo(&cfg)
 	if cfg.MaxUpstreamInFlight != 7 || cfg.EvalBudget != 3*time.Second || cfg.UpstreamHost != "origin.internal" || cfg.MaxConnsPerIP != 9 || !cfg.AllowUpgrade || !cfg.LogDetails {
 		t.Errorf("ApplyTo changed a setting that belongs to the machine: %+v", cfg)
 	}
 	if cfg.CRS.UploadDir != "/var/lib/carnical/uploads" {
 		t.Errorf("the operator's upload directory was overwritten: %q", cfg.CRS.UploadDir)
+	}
+	if !cfg.CRS.DisableLocalRules || !reflect.DeepEqual(cfg.CRS.LocalRulesOff, []int{5006012}) {
+		t.Errorf("the operator's choice of local rules was overwritten: %v %v", cfg.CRS.DisableLocalRules, cfg.CRS.LocalRulesOff)
 	}
 	if !reflect.DeepEqual(cfg.AllowedHosts, []string{"a.example.test"}) || !cfg.WordPress.Enabled || cfg.MaxFormBody != 4096 || !cfg.CRS.InspectResponses || !reflect.DeepEqual(cfg.DenyHeaders, []string{"next-action"}) {
 		t.Errorf("the policy's settings were not applied: %+v", cfg)

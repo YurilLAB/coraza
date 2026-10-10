@@ -7,11 +7,13 @@ rules](../crs/local/), [CLI](../cmd/carnical/main.go).
 ## Local rules
 
 Carnical supplements the verified, unmodified CRS release with local rules under `crs/local/`. These
-inspect ARGS, XML text/attributes and cookies (5006011, the request path), adding five inbound PL1
+inspect ARGS, XML text/attributes and cookies (5006011 to 5006014, the request path or the User-Agent), adding five inbound PL1
 anomaly points per finding before the CRS blocking evaluation. They load after CRS score initialization and before its attack
 rules, preserving scores in multiphase builds. They share `-mode` and thresholds;
-`-local-rules=false` omits them. The library setting is `crs.Settings.DisableLocalRules`. URL, HTML
-and JavaScript decoding is for detection only; values are not rewritten.
+`-local-rules=false` omits them, and `-local-rules-off 5006012,5006013` omits single rules by id (at most 32;
+an id that is not a local rule is refused at start). The library settings are `crs.Settings.DisableLocalRules` and
+`crs.Settings.LocalRulesOff`; a policy file cannot change them. URL, HTML and JavaScript decoding is for detection
+only; values are not rewritten.
 
 | Rule | Family |
 | --- | --- |
@@ -21,7 +23,19 @@ and JavaScript decoding is for detection only; values are not rewritten.
 | 5006006 | Parent traversal, including nested percent-encoded markers |
 | 5006007 | Base64/hex Java serialization stream markers |
 | 5006008 | Non-HTTP fetch protocols and ambiguous numeric/userinfo authorities |
-| 5006011 | Paths only an attacker asks for: PHPUnit's `eval-stdin.php`, PHP in WordPress's uploads, cache or upgrade folders (also behind a second extension or path info), the File Manager connectors and PHP in its files folder, Slider Revolution's update folder, and well-known web shells by name. The path is decoded, normalized and lower-cased for matching. It runs for every site, since a scanner asks whether or not WordPress is there; the site's WordPress protections (`wordpress.enabled`) refuse scripts in more of its writable folders and limit logins and xmlrpc.php |
+| 5006011 | Paths only an attacker asks for: PHPUnit's `eval-stdin.php`, PHP in WordPress's uploads, cache or upgrade folders (also behind a second extension or path info), the File Manager connectors and PHP in its files folder, Slider Revolution's update folder, and well-known web shells by name. The path is decoded, normalized and lower-cased for matching. It runs for every site, since a scanner asks whether or not WordPress is there; the site's WordPress protections (`wordpress.enabled`) refuse scripts in more of its writable folders and limit logins and xmlrpc.php. Laravel Ignition's `execute-solution` (CVE-2021-3129) is in the same rule |
+| 5006012 | Debug and diagnostic interfaces that hold secrets or run code: Spring Boot actuator endpoints other than `health`, `info` and `metrics` (also behind a path parameter), Jolokia, Go's `/debug/pprof` and `/debug/vars`, Apache `server-status` and `server-info`, the Symfony profiler and Yii's debug module. A site that serves one on purpose turns the rule off with `-local-rules-off 5006012` |
+| 5006013 | Installers: WordPress `install.php` and `setup-config.php`, Joomla's `installation/index.php` and Drupal's `core/install.php`. Turn it off with `-local-rules-off 5006013` while installing through the edge |
+| 5006014 | Scanners the CRS list leaves out, by their default User-Agent: dirsearch and jaeles |
+| 5006015 | A URL of any scheme, or a `//` or `\\` path, to another host in a parameter named like something to include (`page`, `file`, `path`, `include`, `template`, `module`, `lang`, `theme` and similar, also with a bracket suffix such as `template[0]`, as an item of a JSON array (`{"page":["http://..."]}`), or after a dot such as `settings.module`) |
+| 5006016 | An FTP, SMB or SSH2 address, or a scheme-less `//host/` path, to another host in any parameter |
+| 5006017 | An `http(s)` URL to another host that ends in `.txt` or `.inc`: how remote file inclusion serves PHP without running it first |
+
+Rules 5006015 to 5006017 compare each URL's host with the request's own `Host` header. Every match keeps its host under a key of its
+own, so a repeated parameter cannot hide one URL behind another, and a link to this site or one of its subdomains passes. The
+comparison trusts that header, so set `-hosts` to the names the site answers to (setup does) and the header cannot be chosen by the
+visitor. A link to a `.php` page on another host is not refused in an ordinary parameter: Matomo's `urlref`, comment forms and
+payment callbacks carry those.
 
 Default match logs contain fixed family labels, rule IDs, severity and transaction IDs, omitting
 request content. `-log-details` enables sensitive details. Format rules 5002608/5002809 additionally

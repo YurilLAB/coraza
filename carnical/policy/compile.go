@@ -108,9 +108,10 @@ func Compile(p Policy) (Compiled, error) {
 }
 
 // ApplyTo sets the fields of a proxy.Config that the policy decides. It leaves the rest alone (the upstream, the origin guard,
-// the trusted proxies, the limits that belong to the machine), and it keeps the Core Rule Set's UploadDir that the operator set.
+// the trusted proxies, the limits that belong to the machine), and it keeps the Core Rule Set's UploadDir and the choice of local
+// rules that the operator set, which a policy has no field for.
 func (c Compiled) ApplyTo(cfg *proxy.Config) {
-	uploadDir := cfg.CRS.UploadDir
+	uploadDir, localOff, localRulesOff := cfg.CRS.UploadDir, cfg.CRS.DisableLocalRules, append([]int(nil), cfg.CRS.LocalRulesOff...)
 	cfg.AllowedHosts = append([]string(nil), c.AllowedHosts...)
 	cfg.Paths = c.Paths
 	cfg.DenyHeaders = append([]string(nil), c.DenyHeaders...)
@@ -121,4 +122,5 @@ func (c Compiled) ApplyTo(cfg *proxy.Config) {
 	cfg.CRS = c.CRS
 	cfg.CRS.AllowedMethods = append([]string(nil), c.CRS.AllowedMethods...)
 	cfg.CRS.UploadDir = uploadDir
+	cfg.CRS.DisableLocalRules, cfg.CRS.LocalRulesOff = localOff, localRulesOff
 }

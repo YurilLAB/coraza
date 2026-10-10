@@ -92,6 +92,7 @@ func runFlags(args []string, private map[string]string) error {
 	requestEncoding := flags.Bool("allow-request-encoding", false, "allow one bounded gzip or deflate layer through the format inspector (requires formats enabled)")
 	responses := flags.Bool("inspect-responses", false, "also run the CRS response rules (buffers text, HTML and XML responses)")
 	localRules := flags.Bool("local-rules", true, "run Carnical supplemental injection rules at PL1, with the selected CRS mode and threshold")
+	localRulesOff := flags.String("local-rules-off", "", "comma-separated ids of single local rules to switch off (5006001 to 5006017; at most 32)")
 	apiSpec := flags.String("api-spec", "", "local OpenAPI JSON/YAML contract; scalar/array parameters and JSON bodies (no fetching or learning)")
 	apiSpecMode := flags.String("api-spec-mode", "block", "OpenAPI contract action: block or monitor (block requires formats block)")
 	methods := flags.String("allowed-methods", "", "comma-separated HTTP methods to allow (default: the CRS list GET HEAD POST OPTIONS)")
@@ -238,6 +239,13 @@ func runFlags(args []string, private map[string]string) error {
 	settings.RequestBodyLimit = *maxBody
 	settings.InspectResponses = *responses
 	settings.DisableLocalRules = !*localRules
+	for _, field := range splitList(*localRulesOff) {
+		id, err := strconv.Atoi(field)
+		if err != nil {
+			return fmt.Errorf("-local-rules-off: %q is not a rule id", field)
+		}
+		settings.LocalRulesOff = append(settings.LocalRulesOff, id)
+	}
 	settings.UploadDir = *uploadDir
 	if *methods != "" {
 		for _, m := range strings.Split(*methods, ",") {

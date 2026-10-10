@@ -28,6 +28,18 @@ func LocalRuleMessage(id int) string {
 		return "Obfuscated shell command spelling"
 	case 5006011:
 		return "Exploit or web shell path"
+	case 5006012:
+		return "Debug or diagnostic interface"
+	case 5006013:
+		return "Web application installer"
+	case 5006014:
+		return "Scanner user agent"
+	case 5006015:
+		return "Remote file reference in an include parameter"
+	case 5006016:
+		return "FTP, SMB or scheme-less reference to another host"
+	case 5006017:
+		return "Remote text or include file URL"
 	default:
 		return ""
 	}
