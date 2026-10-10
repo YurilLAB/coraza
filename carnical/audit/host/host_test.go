@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"runtime"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -560,6 +561,46 @@ func TestAuditd(t *testing.T) {
 	for _, k := range AuditKeys {
 		if !strings.Contains(string(file), "-k "+k) {
 			t.Errorf("the check looks for the key %s, which the rules file does not set", k)
+		}
+	}
+	// A system call name auditctl does not know stops the whole file loading, the lock included. These are the names, as
+	// audit-userspace's own tables spell them, that each architecture a rule can name is known to have (b64 means
+	// whichever 64-bit table the machine runs: x86_64 or aarch64, so only names both have). Numbers are always accepted.
+	both := "execve execveat ptrace process_vm_readv process_vm_writev memfd_create bpf unshare setns init_module " +
+		"finit_module delete_module kexec_load fchmod fchmodat"
+	known := map[string]string{"b64": both, "x86_64": both + " chmod",
+		"i386": "execve execveat ptrace process_vm_readv process_vm_writev memfd_create bpf unshare setns init_module " +
+			"finit_module delete_module fchmod fchmodat chmod"}
+	calls := regexp.MustCompile(`-F arch=(\S+) -S (\S+)`)
+	syscallRules := 0
+	for _, line := range strings.Split(string(file), "\n") {
+		if !strings.HasPrefix(line, "-a ") {
+			continue
+		}
+		m := calls.FindStringSubmatch(line)
+		if m == nil {
+			t.Errorf("a rule without an architecture before its system calls: %s", line)
+			continue
+		}
+		syscallRules++
+		names, ok := known[m[1]]
+		if !ok {
+			t.Errorf("an architecture this test does not know: %s", line)
+		}
+		for _, name := range strings.Split(m[2], ",") {
+			if _, err := strconv.Atoi(name); err != nil && !slices.Contains(strings.Fields(names), name) {
+				t.Errorf("%s may not be known to auditctl for %s (write it by number): %s", name, m[1], line)
+			}
+		}
+	}
+	if syscallRules == 0 {
+		t.Error("no system call rules found in the rules file")
+	}
+	// Every call that can set a setuid bit, in each table the rules name (aarch64 has no chmod; fchmodat2 is written as 452).
+	for _, want := range []string{"arch=b64 -S fchmod -F a1&06000", "arch=b64 -S fchmodat,452 -F a2&06000", "arch=x86_64 -S chmod -F a1&06000",
+		"arch=i386 -S chmod,fchmod -F a1&06000", "arch=i386 -S fchmodat,452 -F a2&06000"} {
+		if !strings.Contains(string(file), want) {
+			t.Errorf("the rules file does not audit %q", want)
 		}
 	}
 }

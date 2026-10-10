@@ -70,7 +70,8 @@ SystemCallFilter=~@privileged @mount @debug @raw-io @reboot @swap @module @cpu-e
 SystemCallFilter=~io_uring_setup io_uring_enter io_uring_register userfaultfd memfd_create process_vm_readv process_vm_writev kcmp
 # The cloud metadata service answers anyone on the machine and holds credentials; nothing here has a reason to ask it.
 # 168.63.129.16 is Azure's equivalent outside link-local. Names are resolved through the local stub, which is not refused;
-# where resolv.conf names 168.63.129.16 itself, add IPAddressAllow=168.63.129.16 in a drop-in (nftables keeps it to port 53).
+# where resolv.conf names 168.63.129.16 itself, add IPAddressAllow=168.63.129.16 in a drop-in and name it as the resolver in
+# carnical.nft, which then lets the edge reach it on port 53 only.
 IPAddressDeny=link-local 168.63.129.16
 SocketBindDeny=any
 

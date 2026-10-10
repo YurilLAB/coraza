@@ -8,21 +8,32 @@
 -b 8192
 -f 1
 
+## Every name below exists on both x86_64 and aarch64: an unknown name stops the whole file from loading, the lock at the
+## end included. A rule that names another architecture (i386, x86_64) loads anywhere and only ever matches there. The i386
+## copies close the 32-bit entry that x86_64 keeps for old programs; the edge's unit allows only native calls anyway.
+
 ## The edge is a Go program that never starts another program. Any exec by it is an attacker. (It cannot do it: the
 ## seccomp filter ends the process first, and the kernel writes a SECCOMP record for the call, which is the other half
-## of this.)
--a always,exit -F arch=b64 -S execve,execveat -F uid=carnical-edge -k carnical_svc_exec
+## of this.) systemd starting the edge's own program is the one exec that is not, so it is left out by path.
+-a always,exit -F arch=b64 -S execve,execveat -F uid=carnical-edge -F exe!=/usr/local/bin/carnical -k carnical_svc_exec
 -a always,exit -F arch=b64 -S execve,execveat -F uid=carnical-portal -k carnical_svc_exec
 -a always,exit -F arch=b64 -S execve,execveat -F uid=carnical-ctl -k carnical_svc_exec
 -a always,exit -F arch=b64 -S execve,execveat -F uid=carnical-signer -k carnical_svc_exec
 
 ## Things an attacker does with a foothold, by any user that is not root.
 -a always,exit -F arch=b64 -S ptrace,process_vm_readv,process_vm_writev,memfd_create,bpf,unshare,setns,init_module,finit_module,delete_module,kexec_load -F auid=unset -F uid!=0 -k carnical_abuse
+## (auditctl's i386 table spells kexec_load as sys_kexec_load, so it is written by its number there, 283.)
+-a always,exit -F arch=i386 -S ptrace,process_vm_readv,process_vm_writev,memfd_create,bpf,unshare,setns,init_module,finit_module,delete_module,283 -F auid=unset -F uid!=0 -k carnical_abuse
 
-## A file made setuid or setgid. The mode is the second argument of chmod and fchmod, and the third of fchmodat (after the
-## directory and the path), which is what chmod(1) calls.
--a always,exit -F arch=b64 -S chmod,fchmod -F a1&06000 -k carnical_setuid
--a always,exit -F arch=b64 -S fchmodat -F a2&06000 -k carnical_setuid
+## A file made setuid or setgid. The mode is the second argument of chmod and fchmod, and the third of fchmodat and
+## fchmodat2 (after the directory and the path); chmod(1) calls one of the last two. fchmodat2 (Linux 6.6) is written by
+## its number, 452 on every architecture, because an auditctl that predates it does not know the name. chmod itself
+## exists only on x86, so its 64-bit rule names x86_64.
+-a always,exit -F arch=b64 -S fchmod -F a1&06000 -k carnical_setuid
+-a always,exit -F arch=b64 -S fchmodat,452 -F a2&06000 -k carnical_setuid
+-a always,exit -F arch=x86_64 -S chmod -F a1&06000 -k carnical_setuid
+-a always,exit -F arch=i386 -S chmod,fchmod -F a1&06000 -k carnical_setuid
+-a always,exit -F arch=i386 -S fchmodat,452 -F a2&06000 -k carnical_setuid
 
 ## Changes to what runs at boot or on a schedule, who may become root, how libraries are loaded, and how people log in.
 -w /etc/ld.so.preload -p wa -k carnical_persist
