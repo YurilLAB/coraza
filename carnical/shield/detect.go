@@ -201,6 +201,7 @@ type attackInfo struct {
 	fps, paths   map[uint64]bool
 	unknownRate  float64
 	clusterRate  float64
+	knownRate    float64
 	pathAttack   bool
 	fingerprints int
 }
@@ -251,6 +252,7 @@ type detector struct {
 	idsLast      int64
 	idsReported  bool
 	unknownRate  func(base float64) float64
+	knownRate    func(base float64) float64
 	clusterRate  float64
 	clusterShare float64
 }
@@ -690,12 +692,16 @@ func (d *detector) startAttack(ns int64, a aggregate, reasons []string, fpAttack
 	d.incident = &incidentAcc{start: ns, peak: a.rate, baseRate: d.base.rate, srcs: newHLL(14), nets: newHLL(12),
 		labels: newTopK(32), labelSet: newHLL(10)}
 	d.incident.addReasons(reasons)
-	unknown := d.cfg.MinAttackRate
+	unknown, known := d.cfg.MinAttackRate, d.cfg.MinAttackRate
 	if d.unknownRate != nil {
 		unknown = d.unknownRate(d.base.rate)
 	}
+	if d.knownRate != nil {
+		known = d.knownRate(d.base.rate)
+	}
 	cluster := math.Max(d.clusterRate, d.clusterShare*d.base.rate) // look-alike requests may be a small share of a big site
-	d.info.Store(&attackInfo{epoch: d.epoch, since: ns, fps: map[uint64]bool{}, paths: map[uint64]bool{}, unknownRate: unknown, clusterRate: cluster})
+	d.info.Store(&attackInfo{epoch: d.epoch, since: ns, fps: map[uint64]bool{}, paths: map[uint64]bool{}, unknownRate: unknown,
+		clusterRate: cluster, knownRate: known})
 	d.widen(a, fpAttack, pathAttack)
 	d.emit(d.incidentEvent("attack_start", ns))
 }

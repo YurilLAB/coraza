@@ -38,6 +38,7 @@ const (
 	idMethodOverride      = 5000044
 	idUpstreamFailed      = 5000050
 	idUpstreamBindRetry   = 5000051
+	idUpstreamReclaimed   = 5000052
 	idCrowdSecBan         = 5000060
 	idCrowdSecUnavailable = 5000061
 )

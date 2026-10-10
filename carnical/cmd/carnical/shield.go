@@ -24,6 +24,8 @@ type shieldFlags struct {
 	challenge   bool
 	baseline    float64
 	ranges      string
+	// knownFactor and knownRate are the budget returning visitors with standing share during an attack (0 means the default).
+	knownFactor, knownRate float64
 }
 
 // configureShield builds the flood protection from the command line. It returns nil for -ddos off. The address-range
@@ -41,7 +43,7 @@ func configureShield(log *slog.Logger, f shieldFlags, trusted []netip.Prefix) (*
 	}
 	cfg := shield.Config{
 		RequestRate: f.rate, RequestBurst: f.burst, MaxConns: f.maxConns, NoChallenge: !f.challenge,
-		MonitorOnly: f.mode == "monitor", Trusted: trusted,
+		MonitorOnly: f.mode == "monitor", Trusted: trusted, KnownFactor: f.knownFactor, MinKnownRate: f.knownRate,
 		Detector: shield.DetectorConfig{InitialRate: f.baseline},
 		OnEvent:  func(ev shield.Event) { logShieldEvent(log, ev) },
 	}

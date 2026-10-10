@@ -335,6 +335,44 @@ func TestSimulatedAttacks(t *testing.T) {
 		}
 	})
 
+	// A patient botnet: 2,000 addresses that each loaded the home page every 100 seconds, like a person, for ten minutes before
+	// the attack, and so earned standing. The control gives standing no budget of its own (as before the standing budget
+	// existed): the bots then go straight through.
+	patient := func(t *testing.T, mod func(*Config)) result {
+		m := newSim(t, mod)
+		bots := botnet(2_000, m.r)
+		for i := range bots {
+			bots[i].browser = 0
+		}
+		for sec := 0; sec < 10*60; sec++ {
+			m.second(m.kv, m.nv, 20, func(i int) {
+				b := bots[(sec*20+i)%len(bots)]
+				m.do("bots earning standing", b, "/", true, browsers[0])
+			})
+		}
+		if st := m.s.State(); st != Normal {
+			t.Fatalf("after warm-up the state is %v", st)
+		}
+		m.stats = map[string]*tally{}
+		return m.run(90, 3000, func(i int) {
+			m.do("attack", bots[m.r.IntN(len(bots))], "/search?q="+strconv.Itoa(m.r.IntN(1e9)), true, browsers[0])
+		})
+	}
+	t.Run("a botnet that earned standing before it attacks, copying a real browser", func(t *testing.T) {
+		res := patient(t, nil)
+		t.Log(res)
+		if res.detectedAfter < 0 || res.detectedAfter > 12 || res.attackAdmitted > 0.05 || res.known < 0.95 || res.new < 0.85 {
+			t.Fatal("protection below the bar")
+		}
+	})
+	t.Run("the same botnet with standing unbudgeted (control: the standing budget is what holds it)", func(t *testing.T) {
+		res := patient(t, func(c *Config) { c.KnownFactor = 1e6 })
+		t.Log(res)
+		if res.detectedAfter < 0 || res.known > 0.2 {
+			t.Fatal("with standing unbudgeted the attack was missed or visitors were still served: the simulation does not test the budget")
+		}
+	})
+
 	t.Run("a newsletter sends a crowd to one article whose assets are on another host (taken for an attack, people still served)", func(t *testing.T) {
 		m := newSim(t, nil)
 		m.warm(10)

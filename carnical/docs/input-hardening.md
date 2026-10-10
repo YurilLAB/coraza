@@ -56,6 +56,9 @@ creation is retried, with at most three total attempts and the origin policy che
 Cancellation and other failures remain terminal; established-connection errors do not replay
 requests.
 
+Rule 5000052 records that a response the client had stopped reading was ended to give its upstream place to another
+request (see [flood protection](ddos.md#clients-that-stop-reading)). It is a warning, not an attack verdict.
+
 This preserves separate connections for body-bearing requests and the existing desynchronization
 defense. Windows 10048 was reproduced under this load test; [Microsoft documents its
 address-collision

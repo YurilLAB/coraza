@@ -140,7 +140,7 @@ type Edge struct {
 	originTLS         *tls.Config
 	waf               coraza.WAF
 	handler           http.Handler
-	slots             chan struct{}
+	places            *upstreamPlaces
 	hosts             map[string]bool
 	deny              map[string]bool
 	limiter           rateLimiter
@@ -212,7 +212,7 @@ func New(cfg Config) (*Edge, error) {
 	if slots <= 0 {
 		slots = 256
 	}
-	e.slots = make(chan struct{}, slots)
+	e.places = newUpstreamPlaces(slots)
 	budget := cfg.EvalBudget
 	if budget == 0 {
 		budget = 2 * time.Second
@@ -314,6 +314,9 @@ func (e *Edge) guard(next http.Handler) http.Handler {
 		}
 		// Coraza splits RemoteAddr at its last colon, so an IPv6 address is given without brackets.
 		r.RemoteAddr = fmt.Sprintf("%s:%d", addr, port)
+		watch := &writeWatch{ResponseWriter: w}
+		w = watch
+		r = r.WithContext(context.WithValue(r.Context(), writeWatchKey{}, watch))
 		if cs := e.cfg.CrowdSec; cs != nil {
 			action := cs.Check(addr)
 			if action != crowdsec.Allow {
@@ -618,14 +621,26 @@ func (e *Edge) forward() http.Handler {
 		},
 	}
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		select {
-		case e.slots <- struct{}{}:
-			defer func() { <-e.slots }()
-		default:
+		watch, _ := r.Context().Value(writeWatchKey{}).(*writeWatch)
+		ok, reclaimed := e.places.acquire(watch)
+		if reclaimed && e.cfg.OnMatch != nil {
+			e.cfg.OnMatch(Match{RuleID: idUpstreamReclaimed, Severity: "WARNING", Disruptive: true,
+				Message: "a response the client stopped reading was ended to free an upstream place"})
+		}
+		if !ok {
 			markOrigin(r.Context()) // the application has as many requests as it may take: that is its health too
 			w.Header().Set("Retry-After", "1")
 			http.Error(w, "busy", http.StatusServiceUnavailable)
 			return
+		}
+		defer e.places.release(watch)
+		if watch != nil {
+			// Ending this response to free its place (see stall.go) also cancels its request to the application, at once, so that
+			// the application never has more requests than places while the ended response's handler is returning.
+			ctx, cancel := context.WithCancel(r.Context())
+			defer cancel()
+			watch.setCancel(cancel)
+			r = r.WithContext(ctx)
 		}
 		rp.ServeHTTP(noInterim{w}, r)
 	})

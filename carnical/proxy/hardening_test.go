@@ -13,6 +13,7 @@ import (
 	"net/http/httptest"
 	"net/netip"
 	"net/url"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -21,6 +22,7 @@ import (
 	"time"
 
 	"golang.org/x/net/http2"
+	"golang.org/x/net/http2/hpack"
 
 	"github.com/YurilLAB/coraza/carnical/crowdsec"
 	"github.com/YurilLAB/coraza/carnical/crs"
@@ -881,6 +883,549 @@ func TestHTTP2LimitsAreAdvertisedToClients(t *testing.T) {
 			}
 			return
 		}
+	}
+}
+
+// stallEdge serves a large response at /big through an edge with the given number of upstream places, over TLS with HTTP/2.
+func stallEdge(t *testing.T, places int, active *atomic.Int64) (*httptest.Server, *Edge, *refusals, *x509.CertPool) {
+	t.Helper()
+	chunk := []byte(strings.Repeat("x", 64<<10)) // /big never ends: more than every socket buffer on the way
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/plain")
+		if r.URL.Path == "/big" {
+			active.Add(1) // requests at the application with a response it is still sending
+			defer active.Add(-1)
+			for r.Context().Err() == nil {
+				if _, err := w.Write(chunk); err != nil {
+					return
+				}
+			}
+			return
+		}
+		_, _ = w.Write([]byte("ok")) // nothing to do if the edge has gone
+	}))
+	t.Cleanup(up.Close)
+	rec := &refusals{}
+	cfg := Config{Upstream: mustURL(up.URL), Origin: loopback, CRS: crs.DefaultSettings(), MaxUpstreamInFlight: places, OnMatch: rec.record}
+	ruleSetOff(&cfg)
+	e, err := New(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { e.Close() })
+	srv := httptest.NewUnstartedServer(nil)
+	srv.Config = e.Server("")
+	srv.EnableHTTP2 = true
+	srv.StartTLS()
+	t.Cleanup(srv.Close)
+	pool := x509.NewCertPool()
+	pool.AddCert(srv.Certificate())
+	return srv, e, rec, pool
+}
+
+// waitActive waits until the application is sending exactly want large responses.
+func waitActive(t *testing.T, active *atomic.Int64, want int64, within time.Duration) {
+	t.Helper()
+	for deadline := time.Now().Add(within); active.Load() != want; time.Sleep(10 * time.Millisecond) {
+		if time.Now().After(deadline) {
+			t.Fatalf("%d requests are being answered by the application, want %d within %v", active.Load(), want, within)
+		}
+	}
+}
+
+// waitStuck waits until n responses are held at a write the client does not take.
+func waitStuck(t *testing.T, e *Edge, n int) {
+	t.Helper()
+	for deadline := time.Now().Add(10 * time.Second); ; {
+		stuck := 0
+		e.places.mu.Lock()
+		for w := range e.places.held {
+			if w.since.Load() != 0 {
+				stuck++
+			}
+		}
+		e.places.mu.Unlock()
+		if stuck >= n {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("%d responses stuck, want %d", stuck, n)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+func fetch(t *testing.T, srv *httptest.Server, pool *x509.CertPool) int {
+	t.Helper()
+	c := &http.Client{Timeout: 10 * time.Second, Transport: &http.Transport{TLSClientConfig: &tls.Config{RootCAs: pool, ServerName: "example.com"}}}
+	defer c.CloseIdleConnections()
+	resp, err := c.Get(srv.URL + "/")
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	return resp.StatusCode
+}
+
+func (r *refusals) count(id int) (n int) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	for _, x := range r.ids {
+		if x == id {
+			n++
+		}
+	}
+	return n
+}
+
+// A client that opens requests and then reads nothing must not hold the upstream's places, and so the whole site, until
+// the write timeout. When no place is free, the response stuck the longest (at least stallGrace) is ended; while places
+// are free, a slow reader is left alone.
+func TestAClientThatStopsReadingCannotHoldTheUpstream(t *testing.T) {
+	t.Run("HTTP/2 streams with a window of zero", func(t *testing.T) {
+		t.Parallel()
+		var active atomic.Int64
+		srv, e, rec, pool := stallEdge(t, 4, &active)
+		conn, err := tls.Dial("tcp", srv.Listener.Addr().String(), &tls.Config{RootCAs: pool, ServerName: "example.com", NextProtos: []string{"h2"}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer conn.Close()
+		if _, err := conn.Write([]byte(http2.ClientPreface)); err != nil {
+			t.Fatal(err)
+		}
+		fr := http2.NewFramer(conn, conn)
+		if err := fr.WriteSettings(http2.Setting{ID: http2.SettingInitialWindowSize, Val: 0}); err != nil {
+			t.Fatal(err)
+		}
+		var mu sync.Mutex // guards the framer's writes (it is not safe for concurrent use) and the resets seen
+		reset := map[uint32]bool{}
+		go func() { // the connection itself is read; only the streams are never given room
+			for {
+				f, err := fr.ReadFrame()
+				if err != nil {
+					return
+				}
+				switch f := f.(type) {
+				case *http2.SettingsFrame:
+					if !f.IsAck() {
+						mu.Lock()
+						_ = fr.WriteSettingsAck() // the read loop has no one to tell; a failed write ends the test's reads
+						mu.Unlock()
+					}
+				case *http2.RSTStreamFrame:
+					mu.Lock()
+					reset[f.StreamID] = true
+					mu.Unlock()
+				}
+			}
+		}()
+		var hb strings.Builder
+		open := func(id uint32) {
+			hb.Reset()
+			enc := hpack.NewEncoder(&hb)
+			for _, f := range [][2]string{{":method", "GET"}, {":scheme", "https"}, {":authority", "example.com"}, {":path", "/big"}} {
+				if err := enc.WriteField(hpack.HeaderField{Name: f[0], Value: f[1]}); err != nil {
+					t.Fatal(err)
+				}
+			}
+			mu.Lock()
+			err := fr.WriteHeaders(http2.HeadersFrameParam{StreamID: id, BlockFragment: []byte(hb.String()), EndStream: true, EndHeaders: true})
+			mu.Unlock()
+			if err != nil {
+				t.Fatal(err)
+			}
+		}
+		for _, id := range []uint32{1, 3, 5} {
+			open(id)
+		}
+		waitStuck(t, e, 3)
+		time.Sleep(stallGrace + 500*time.Millisecond)
+		if got := fetch(t, srv, pool); got != http.StatusOK || rec.count(idUpstreamReclaimed) != 0 {
+			t.Fatalf("with a place to spare: status %d, %d responses ended", got, rec.count(idUpstreamReclaimed))
+		}
+		open(7) // now every place is held
+		waitStuck(t, e, 4)
+		waitActive(t, &active, 4, 5*time.Second)
+		if got := fetch(t, srv, pool); got != http.StatusOK || rec.count(idUpstreamReclaimed) != 1 {
+			t.Fatalf("with every place held by streams the client does not read: status %d, %d responses ended", got, rec.count(idUpstreamReclaimed))
+		}
+		waitActive(t, &active, 3, 2*time.Second) // the ended response's request to the application was cancelled with it
+		for deadline := time.Now().Add(5 * time.Second); ; time.Sleep(10 * time.Millisecond) {
+			mu.Lock()
+			n, newest := len(reset), reset[7]
+			mu.Unlock()
+			if n == 1 && !newest {
+				break
+			}
+			if n > 1 || newest || time.Now().After(deadline) {
+				t.Fatalf("streams reset: %v, want one of the three stuck longest", reset)
+			}
+		}
+		// Every request that finished has given back what it held: the three responses still stuck hold three places.
+		for deadline := time.Now().Add(5 * time.Second); ; time.Sleep(10 * time.Millisecond) {
+			e.places.mu.Lock()
+			ending, held, free := e.places.ending, len(e.places.held), len(e.places.free)
+			e.places.mu.Unlock()
+			if ending == 0 && held == 3 && free == 3 {
+				break
+			}
+			if time.Now().After(deadline) {
+				t.Fatalf("%d still ending, %d held, %d places in use (want 0, 3, 3)", ending, held, free)
+			}
+		}
+	})
+	t.Run("HTTP/1.1 connections that stop reading", func(t *testing.T) {
+		t.Parallel()
+		var active atomic.Int64
+		srv, e, rec, pool := stallEdge(t, 2, &active)
+		for i := 0; i < 2; i++ {
+			raw, err := net.Dial("tcp", srv.Listener.Addr().String())
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := raw.(*net.TCPConn).SetReadBuffer(4 << 10); err != nil {
+				t.Fatal(err)
+			}
+			c := tls.Client(raw, &tls.Config{RootCAs: pool, ServerName: "example.com", NextProtos: []string{"http/1.1"}})
+			defer c.Close()
+			if _, err := c.Write([]byte("GET /big HTTP/1.1\r\nHost: example.com\r\n\r\n")); err != nil {
+				t.Fatal(err)
+			}
+		}
+		waitStuck(t, e, 2)
+		// Control: a response that has only just stopped being read is not ended; the site is busy for the moment.
+		if got := fetch(t, srv, pool); got != http.StatusServiceUnavailable || rec.count(idUpstreamReclaimed) != 0 {
+			t.Fatalf("with both places held by writes stuck for under %v: status %d, %d responses ended", stallGrace, got, rec.count(idUpstreamReclaimed))
+		}
+		time.Sleep(stallGrace + 500*time.Millisecond)
+		waitActive(t, &active, 2, 5*time.Second)
+		if got := fetch(t, srv, pool); got != http.StatusOK || rec.count(idUpstreamReclaimed) != 1 {
+			t.Fatalf("with both places held by connections that do not read: status %d, %d responses ended", got, rec.count(idUpstreamReclaimed))
+		}
+		// The ended response's request to the application stops at once, not after the seconds its TLS connection takes to close.
+		waitActive(t, &active, 1, time.Second)
+		// The ended response's handler returns within a few seconds (a TLS connection first tries to send its close_notify to
+		// the client that is not reading) without giving back the place that went to the new request: one place is still
+		// held, by the response that was not ended, which is left to go on.
+		for deadline := time.Now().Add(15 * time.Second); ; time.Sleep(10 * time.Millisecond) {
+			e.places.mu.Lock()
+			ending, held, free := e.places.ending, len(e.places.held), len(e.places.free)
+			e.places.mu.Unlock()
+			if ending == 0 && held == 1 && free == 1 {
+				break
+			}
+			if time.Now().After(deadline) {
+				t.Fatalf("after the ended response's handler should have returned: %d still ending, %d held, %d places in use (want 0, 1, 1)", ending, held, free)
+			}
+		}
+		e.places.mu.Lock()
+		defer e.places.mu.Unlock()
+		for w := range e.places.held {
+			if w.ended || w.since.Load() == 0 {
+				t.Fatal("the response that was not ended is no longer waiting on its client")
+			}
+		}
+	})
+}
+
+// The accounting behind the hand-over, without a network: which response is ended, how many may be finishing at once, and that
+// a place goes back exactly once.
+func TestUpstreamPlacesAreHandedOverWithinTheirLimits(t *testing.T) {
+	const n = 16 // at most two ended responses may be finishing at once
+	p := newUpstreamPlaces(n)
+	var held []*writeWatch
+	for i := 0; i < n; i++ {
+		w := &writeWatch{ResponseWriter: httptest.NewRecorder()}
+		if ok, reclaimed := p.acquire(w); !ok || reclaimed {
+			t.Fatalf("place %d of %d: ok %v, reclaimed %v", i+1, n, ok, reclaimed)
+		}
+		held = append(held, w)
+	}
+	stuckFor := func(w *writeWatch, d time.Duration) { w.since.Store(monotonic() - int64(d)) }
+	acquire := func() (bool, bool, *writeWatch) {
+		w := &writeWatch{ResponseWriter: httptest.NewRecorder()}
+		ok, reclaimed := p.acquire(w)
+		return ok, reclaimed, w
+	}
+
+	if ok, _, _ := acquire(); ok {
+		t.Fatal("a place was found with nothing writing")
+	}
+	for _, w := range held {
+		stuckFor(w, stallGrace-time.Second)
+	}
+	if ok, _, _ := acquire(); ok {
+		t.Fatalf("a place was taken from a write stuck for under %v", stallGrace)
+	}
+	for i, w := range held {
+		stuckFor(w, time.Duration(30-i)*time.Second) // the first has waited longest
+	}
+	stuckFor(held[n-1], time.Second) // not yet long enough
+	if ok, _, _ := acquire(); !ok {
+		t.Fatal("no place was handed over although writes had been stuck for 30 seconds")
+	}
+	if !held[0].ended || held[1].ended {
+		t.Fatalf("ended: first %v, second %v: want the response stuck longest, and only it", held[0].ended, held[1].ended)
+	}
+	if ok, reclaimed, _ := acquire(); !ok || !reclaimed || !held[1].ended || held[2].ended {
+		t.Fatalf("second hand-over: ok %v, reclaimed %v, ended %v %v", ok, reclaimed, held[1].ended, held[2].ended)
+	}
+	if ok, _, _ := acquire(); ok || held[2].ended {
+		t.Fatal("a third response was ended while two were still finishing")
+	}
+	p.release(held[0]) // the first ended response's handler returns
+	if p.ending != 1 || len(p.free) != n {
+		t.Fatalf("after one returned: %d finishing, %d places in use (want 1, %d): its place must not be given back twice", p.ending, len(p.free), n)
+	}
+	if ok, reclaimed, _ := acquire(); !ok || !reclaimed || !held[2].ended {
+		t.Fatalf("after one returned: ok %v, reclaimed %v, third ended %v", ok, reclaimed, held[2].ended)
+	}
+	for _, w := range held[3 : n-1] {
+		w.since.Store(0) // not writing: never taken from
+	}
+	p.release(held[1])
+	p.release(held[2])
+	if ok, _, _ := acquire(); ok {
+		t.Fatal("a place was taken from a response that was not stuck")
+	}
+	p.release(held[n-1])
+	if ok, reclaimed, _ := acquire(); !ok || reclaimed {
+		t.Fatalf("a released place: ok %v, reclaimed %v", ok, reclaimed)
+	}
+}
+
+// Many requests take places, some get stuck and are ended by the others, and every one releases: at no moment do more requests run
+// than there are places plus the ended ones still finishing, and every place is back at the end.
+func TestUpstreamPlacesHoldTheirLimitsUnderLoad(t *testing.T) {
+	const n = 16
+	p := newUpstreamPlaces(n)
+	var running, ended, peak atomic.Int64
+	var wg sync.WaitGroup
+	for g := 0; g < 48; g++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for i := 0; i < 400; i++ {
+				w := &writeWatch{ResponseWriter: httptest.NewRecorder()}
+				ok, reclaimed := p.acquire(w)
+				if !ok {
+					continue
+				}
+				if reclaimed {
+					ended.Add(1)
+				}
+				now := running.Add(1)
+				for {
+					seen := peak.Load()
+					if now <= seen || peak.CompareAndSwap(seen, now) {
+						break
+					}
+				}
+				if i%3 == 0 {
+					w.since.Store(monotonic() - int64(time.Hour)) // stuck, for as long as it takes someone to end it
+					for spins := 0; spins < 200; spins++ {
+						p.mu.Lock()
+						done := w.ended
+						p.mu.Unlock()
+						if done {
+							break
+						}
+						runtime.Gosched()
+					}
+					w.since.Store(0)
+				}
+				running.Add(-1)
+				p.release(w)
+			}
+		}()
+	}
+	wg.Wait()
+	if got, limit := peak.Load(), int64(n+p.maxEnding); got > limit {
+		t.Fatalf("%d requests ran at once, more than %d places and %d ended ones finishing", got, n, p.maxEnding)
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if len(p.free) != 0 || p.ending != 0 || len(p.held) != 0 {
+		t.Fatalf("after every request returned: %d places in use, %d finishing, %d held (want 0, 0, 0)", len(p.free), p.ending, len(p.held))
+	}
+	if ended.Load() == 0 {
+		t.Fatal("no response was ended: the test did not exercise the hand-over")
+	}
+}
+
+// stuckClient is a response writer for a client that reads nothing and cannot be given a write deadline: its Write waits.
+type stuckClient struct {
+	header  http.Header
+	in      chan struct{}
+	release chan struct{}
+	once    sync.Once
+}
+
+func (s *stuckClient) Header() http.Header { return s.header }
+func (s *stuckClient) WriteHeader(int)     {}
+func (s *stuckClient) Write(b []byte) (int, error) {
+	s.once.Do(func() { close(s.in) })
+	<-s.release
+	return len(b), nil
+}
+
+// Ending a response that cannot be cut by a deadline still stops its request to the application, at once: the guarantee does not
+// depend on what the web server does when a client's connection fails.
+func TestEndingAResponseAlsoCancelsItsRequestToTheApplication(t *testing.T) {
+	started, cancelled, giveUp := make(chan struct{}), make(chan struct{}), make(chan struct{})
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/slow" {
+			_, _ = w.Write([]byte("ok"))
+			return
+		}
+		_, _ = w.Write([]byte("the first of a response that never ends"))
+		w.(http.Flusher).Flush()
+		close(started)
+		select {
+		case <-r.Context().Done(): // the edge closing its connection to the application is what ends this
+			close(cancelled)
+		case <-giveUp: // the test is over, and did not see that happen
+		}
+	}))
+	t.Cleanup(up.Close)
+	t.Cleanup(func() { close(giveUp) })
+	cfg := Config{Upstream: mustURL(up.URL), Origin: loopback, CRS: crs.DefaultSettings(), MaxUpstreamInFlight: 1}
+	ruleSetOff(&cfg)
+	e, err := New(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { e.Close() })
+	stuck := &stuckClient{header: http.Header{}, in: make(chan struct{}), release: make(chan struct{})}
+	t.Cleanup(func() { close(stuck.release) })
+	go e.ServeHTTP(stuck, httptest.NewRequest(http.MethodGet, "/slow", nil))
+	<-started
+	<-stuck.in
+	e.places.mu.Lock()
+	for w := range e.places.held {
+		w.since.Store(monotonic() - int64(time.Minute)) // stuck for long enough
+	}
+	e.places.mu.Unlock()
+	rec := httptest.NewRecorder()
+	e.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/", nil))
+	if rec.Code != http.StatusOK || rec.Body.String() != "ok" {
+		t.Fatalf("the request that needed the place: status %d, body %q", rec.Code, rec.Body.String())
+	}
+	select {
+	case <-cancelled:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the request to the application of the ended response was not cancelled")
+	}
+}
+
+// deadlineBlocker is a response writer whose SetWriteDeadline does not come back until told to.
+type deadlineBlocker struct {
+	http.ResponseWriter
+	in, out chan struct{}
+}
+
+func (d deadlineBlocker) SetWriteDeadline(time.Time) error { close(d.in); <-d.out; return nil }
+
+// The call that ends a stuck response may be slow to come back. It must not hold up anything else: other requests take and give
+// back places meanwhile, the request that was waiting for a place has it at once, and the ended response's handler does not
+// return until the call is done with its writer.
+func TestAStuckCallThatEndsAResponseDoesNotStallThePlaces(t *testing.T) {
+	within := func(what string, f func()) {
+		t.Helper()
+		done := make(chan struct{})
+		go func() { f(); close(done) }()
+		select {
+		case <-done:
+		case <-time.After(5 * time.Second):
+			t.Fatal(what)
+		}
+	}
+	p := newUpstreamPlaces(2)
+	blocker := deadlineBlocker{httptest.NewRecorder(), make(chan struct{}), make(chan struct{})}
+	victim := &writeWatch{ResponseWriter: blocker}
+	other := &writeWatch{ResponseWriter: httptest.NewRecorder()}
+	p.acquire(victim)
+	p.acquire(other)
+	victim.since.Store(monotonic() - int64(time.Minute))
+	newcomer := &writeWatch{ResponseWriter: httptest.NewRecorder()}
+	within("the request waiting for a place was held up by the call that ends the response", func() {
+		if ok, reclaimed := p.acquire(newcomer); !ok || !reclaimed {
+			t.Errorf("acquire: ok %v, reclaimed %v", ok, reclaimed)
+		}
+	})
+	<-blocker.in // the call is under way, and does not return
+	within("other requests were held up by the call that ends a response", func() {
+		p.release(other)
+		again := &writeWatch{ResponseWriter: httptest.NewRecorder()}
+		if ok, _ := p.acquire(again); !ok {
+			t.Error("a place that was given back was not found")
+		}
+		p.release(again)
+	})
+	returned := make(chan struct{})
+	go func() { p.release(victim); close(returned) }()
+	select {
+	case <-returned:
+		t.Fatal("the ended response's handler returned while its writer was still in use")
+	case <-time.After(100 * time.Millisecond):
+	}
+	close(blocker.out)
+	within("the ended response's handler did not return once the call was done", func() { <-returned })
+	p.release(newcomer)
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if len(p.free) != 0 || p.ending != 0 || len(p.held) != 0 {
+		t.Fatalf("at the end: %d places in use, %d finishing, %d held (want 0, 0, 0)", len(p.free), p.ending, len(p.held))
+	}
+}
+
+// deadlineCounter counts the write deadlines it is given.
+type deadlineCounter struct {
+	http.ResponseWriter
+	n *atomic.Int32
+}
+
+func (d deadlineCounter) SetWriteDeadline(time.Time) error { d.n.Add(1); return nil }
+
+// A response writer may not be used once its handler is returning: ending a response that has finished does nothing.
+func TestEndingAResponseWhoseHandlerIsReturningDoesNothing(t *testing.T) {
+	var calls atomic.Int32
+	w := &writeWatch{ResponseWriter: deadlineCounter{httptest.NewRecorder(), &calls}}
+	w.cut()
+	if calls.Load() != 1 {
+		t.Fatalf("a running response was given %d write deadlines, want 1", calls.Load())
+	}
+	p := newUpstreamPlaces(1)
+	p.acquire(w)
+	p.release(w)
+	w.cut()
+	if calls.Load() != 1 {
+		t.Fatalf("a response whose handler had returned was given %d write deadlines, want 1", calls.Load())
+	}
+}
+
+// flushBlocker is a response writer whose Flush waits to be told to go on, like a socket whose client is not reading.
+type flushBlocker struct {
+	http.ResponseWriter
+	in, out chan struct{}
+}
+
+func (b flushBlocker) Flush() { close(b.in); <-b.out }
+
+func TestAWriteWatchSeesAFlushThatIsStuck(t *testing.T) {
+	b := flushBlocker{httptest.NewRecorder(), make(chan struct{}), make(chan struct{})}
+	w := &writeWatch{ResponseWriter: b}
+	done := make(chan struct{})
+	go func() { w.Flush(); close(done) }()
+	<-b.in
+	if w.since.Load() == 0 {
+		t.Fatal("a flush in progress was not seen")
+	}
+	close(b.out)
+	<-done
+	if w.since.Load() != 0 {
+		t.Fatal("a finished flush is still seen as stuck")
 	}
 }
 

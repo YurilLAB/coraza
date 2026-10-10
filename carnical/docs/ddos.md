@@ -18,7 +18,7 @@ Source: [Shield](../shield/shield.go), [listener](../shield/listener.go),
 | --- | --- |
 | TCP admission | Per-address connection rate, live subnet counts, a global cap and reserved capacity for known clients. |
 | Socket tuning on Linux | `TCP_DEFER_ACCEPT` (10s) delays handing silent connections to the proxy; `TCP_USER_TIMEOUT` (30s) limits stalled acknowledgements. Server deadlines still apply. |
-| Request admission | Per-address and subnet budgets; during an attack, shared budgets for matching traffic and unknown clients. |
+| Request admission | Per-address and subnet budgets; during an attack, shared budgets for known clients, matching traffic and unknown clients. |
 | Response observation | Status and timing inform the detector and client reputation. |
 
 Connections are reserved atomically across listeners sharing a Shield. Live subnet counts are
@@ -62,9 +62,9 @@ combines volume with fingerprint/target concentration, new addresses, engagement
 Volume alone is logged as elevated traffic; it does not declare an attack.
 
 The volume threshold is the largest of four times the baseline, baseline plus eight standard
-deviations, and 20 requests/second. The baseline has a ten-minute time constant, updates only during
-ordinary traffic and grows by at most two times per step. Deviation is measured from nonoverlapping
-ten-second windows.
+deviations, and 20 requests/second. The baseline has a ten-minute time constant, updates whenever no
+attack has been declared (elevated volume without attack evidence included) and grows by at most two
+times per step. Deviation is measured from nonoverlapping ten-second windows.
 
 An attack needs elevated volume plus supporting evidence held for three seconds:
 
@@ -97,10 +97,28 @@ connections before the reserved share. It leaves descriptor headroom but is not 
 Tune `-ddos-max-conns`, origin sockets, TLS and evaluation concurrency from measurements. Kernel
 packet budgets are [configured separately](network-protection.md#choosing-a-budget).
 
+## Clients that stop reading
+
+At most `-max-upstream` requests (default 256) are at the application at once, and a request keeps its place until its
+response has been written to the client. A client that opens requests for large responses and then reads nothing (an HTTP/2
+stream window of zero, or a full TCP window) would hold those places until the 120 second write timeout, and every other
+visitor would be told the site is busy. Reproduced: with the places all held this way, another client got 503 for as long
+as the client kept it up.
+
+Now, when no place is free, the response whose write has been stuck the longest, and for at least five seconds, is ended and
+its place goes to the waiting request at once, and its request to the application is cancelled at the same moment, so the
+application never has more requests than places. A slow client is left alone while there are places to spare. The ended response
+may take a few seconds more to close (a TLS connection first tries to send its `close_notify` to the client that is not
+reading), so at most an eighth of the places can be in that state at once; a request that finds none to take gets the usual
+503. Each case is logged as rule 5000052. The limits are fixed, and what they cost a legitimate client is a download cut
+short when it had stopped taking data for five seconds while the whole site was at its limit.
+
 ## Who still gets through during an attack
 
 - **Known clients** earned five successful requests over at least a minute of ordinary traffic.
-  Standing earned in the minute before an attack does not count. This is reputation, not authentication.
+  Standing earned in the minute before an attack does not count. This is reputation, not authentication:
+  known clients share a budget of twice the site's usual rate (at least 50 requests/second), and beyond
+  it are treated like any other client.
 - **Browser challenges** let an unknown browser outside the budget solve a JavaScript SHA-256
   puzzle (17 leading zero bits) for a cookie tied to its address/browser for 30 minutes.
 - **Other clients** share a budget equal to the site's usual rate. API clients receive 503 and
@@ -123,9 +141,17 @@ previous defects. Those results measure their recorded workload, not production 
 - A saturated uplink needs provider-side mitigation; traffic fills it before reaching the host.
 - The Go listener does not install packet rules. [Linux SYN/UDP guards](network-protection.md)
   and deployment SYN cookies must be installed separately.
-- A patient botnet can earn reputation by behaving normally before attacking; address limits
-  still apply, and repeated attack-time refusals remove its standing.
+- A patient botnet can earn reputation by behaving normally before attacking. The known-client
+  budget caps what that standing lets through; beyond it the bots are challenged or refused like
+  strangers, and an address banned for repeated refusals loses its standing.
+- Limits follow the busiest address and network, not each address's own history: one address that
+  sends heavily for tens of minutes without an attack being declared raises the per-address limit
+  for every address, up to 20 times the floor.
 - A single-page crowd with assets on another host may resemble a targeted flood and trigger challenges.
+- A crowd of returning visitors taken for an attack shares the known-client budget (twice the usual rate, at least 50 requests a second):
+  beyond it they are challenged like anyone else. A browser that answers the challenge is served; a client that cannot (an API
+  client) is refused, and 30 refusals ban its address for ten minutes. A site whose regulars arrive in crowds can raise the budget
+  with `-ddos-known-factor` and `-ddos-known-rate`.
 - State belongs to each process. Plan [replica behavior](availability-and-deployment.md#state-and-replica-contracts).
 
 ## Flags
@@ -135,6 +161,7 @@ previous defects. Those results measure their recorded workload, not production 
 | `-ddos` | `on` | `on`, `monitor` or `off`. |
 | `-ddos-rate`, `-ddos-burst` | 50, 200 | Per-address request floors, with bounded automatic growth. |
 | `-ddos-max-conns` | 20000 | Global connection floor, with bounded automatic growth and reserved capacity. |
+| `-ddos-known-factor`, `-ddos-known-rate` | 2, 50 | During an attack, the budget returning visitors with standing share: this many times the usual request rate, and at least this many a second. Raise them on a site whose regulars come in crowds. |
 | `-ddos-challenge` | true | Enable browser challenges during an attack. |
 | `-ddos-baseline-rate` | 0 | Learn the baseline; a positive value seeds the site's usual requests/second. |
 | `-ddos-ranges` | None | ip2asn-style country/network labels for attack logs. |

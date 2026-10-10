@@ -469,6 +469,9 @@ func TestConfigValidation(t *testing.T) {
 		{"trusted /0", func(c *Config) { c.Trusted = []netip.Prefix{netip.MustParsePrefix("0.0.0.0/0")} }, false},
 		{"exit above entry", func(c *Config) { c.Detector.ExitFactor = 10 }, false},
 		{"a ban count the strike counter cannot reach", func(c *Config) { c.BanAfter = 70000 }, false},
+		{"negative known budget", func(c *Config) { c.MinKnownRate = -1 }, false},
+		{"infinite known factor", func(c *Config) { c.KnownFactor = math.Inf(1) }, false},
+		{"a larger known budget", func(c *Config) { c.KnownFactor, c.MinKnownRate = 4, 500 }, true},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -504,6 +507,135 @@ func TestABanIsRenewedWithinOneAttack(t *testing.T) {
 	}
 	if got := s.counters.banned.Load(); got != 2 {
 		t.Fatalf("%d bans, want 2", got)
+	}
+}
+
+// A known client gets past the attack's budgets only within a budget of its own. A botnet that earned standing before it
+// attacks, each address well under its own limit and sending exactly what the attack sends, is held to that budget, struck
+// and banned like strangers, and loses its standing; a known client comes through again once they are gone. A browser that
+// answered the challenge is not held to the budget.
+func TestStandingDoesNotCarryAFlood(t *testing.T) {
+	now := time.Date(2026, 10, 6, 9, 0, 0, 0, time.UTC)
+	s := newTestShield(t, &now, nil)
+	hdr := []string{"User-Agent", "probe-client/1.0", "Accept", "*/*"}
+	bots := make([]netip.Addr, 200)
+	for i := range bots {
+		bots[i] = netip.AddrFrom4([4]byte{byte(20 + i%100), byte(i / 100), 7, 1}) // each in a network of its own
+	}
+	person := netip.MustParseAddr("198.51.100.9")
+	// Ordinary traffic for two minutes; every bot and the person earn standing with a request every 20 seconds.
+	for sec := 0; sec < 120; sec++ {
+		start := now
+		for i := 0; i < 20; i++ {
+			now = start.Add(time.Duration(i+1) * 40 * time.Millisecond)
+			s.Done(s.Admit(req("GET", "/", "User-Agent", "Mozilla/5.0", "Accept", "text/html"), netip.AddrFrom4([4]byte{10, 1, byte(i), 1})), 200, true)
+		}
+		if sec%20 == 0 {
+			for _, a := range append([]netip.Addr{person}, bots...) {
+				now = now.Add(time.Microsecond)
+				s.Done(s.Admit(req("GET", "/", hdr...), a), 200, true)
+			}
+		}
+		now = start.Add(time.Second)
+		s.Tick()
+	}
+	for _, a := range append([]netip.Addr{person}, bots...) {
+		if !s.sources.peek(SourceKey(a), func(src *source) {
+			if src.knownUntil <= now.UnixNano() {
+				t.Fatalf("%s did not earn standing", a)
+			}
+		}) {
+			t.Fatalf("%s is not remembered", a)
+		}
+	}
+	fp, _ := fingerprint(req("GET", "/", hdr...))
+	now = now.Add(10 * time.Minute)
+	s.det.info.Store(&attackInfo{epoch: 1, since: now.UnixNano(), fps: map[uint64]bool{fp: true}, paths: map[uint64]bool{}, knownRate: 50})
+	admitted, sent := 0, 0
+	for sec := 0; sec < 60; sec++ {
+		start := now
+		for i := 0; i < 10; i++ { // ten a second from each bot: 2,000 a second, a fifth of each address's own limit
+			for j, a := range bots {
+				now = start.Add(time.Duration(i*len(bots)+j+1) * 400 * time.Microsecond)
+				sent++
+				if s.Admit(req("GET", "/", hdr...), a).Action == Allow {
+					admitted++
+				}
+			}
+		}
+		now = start.Add(time.Second)
+	}
+	if limit := 50*60 + 200; admitted > limit {
+		t.Fatalf("the bots with standing got %d of %d requests through, more than the known budget of %d", admitted, sent, limit)
+	}
+	banned := 0
+	for _, a := range bots {
+		s.sources.peek(SourceKey(a), func(src *source) {
+			if src.bannedUntil > now.UnixNano() && src.knownUntil <= now.UnixNano() {
+				banned++
+			}
+		})
+	}
+	t.Logf("bots with standing: %d of %d requests admitted, %d of %d banned", admitted, sent, banned, len(bots))
+	if banned < len(bots)*9/10 {
+		t.Fatalf("only %d of %d bots were banned and lost their standing", banned, len(bots))
+	}
+	for i := 0; i < 10; i++ {
+		now = now.Add(100 * time.Millisecond)
+		if d := s.Admit(req("GET", "/", hdr...), person); d.Action != Allow {
+			t.Fatalf("request %d of a known client was refused once the bots were banned: %+v", i, d)
+		}
+	}
+	// A browser that answered the challenge, from an address the shield never saw, while the known budget is spent.
+	browser := netip.MustParseAddr("192.0.2.77")
+	tok := s.token(browser, now)
+	v := s.verify(req("GET", VerifyPath+"?t="+tok+"&n="+solve(tok, 8), "User-Agent", "probe-client/1.0"), browser, now)
+	if v.resp.cookie == nil {
+		t.Fatalf("verify: %+v", v)
+	}
+	s.knownBudget = bucket{tokens: 0, last: now.UnixNano()}
+	for i := 0; i < 100; i++ {
+		now = now.Add(20 * time.Millisecond)
+		r := req("GET", "/", hdr...)
+		r.AddCookie(v.resp.cookie)
+		if d := s.Admit(r, browser); d.Action != Allow {
+			t.Fatalf("request %d of a browser that answered the challenge was refused: %+v", i, d)
+		}
+	}
+	// A page load is a burst of requests at once: a new attack's known budget starts with a burst, not with one request.
+	s.det.info.Store(&attackInfo{epoch: 2, since: now.UnixNano(), fps: map[uint64]bool{fp: true}, paths: map[uint64]bool{}, knownRate: 50})
+	for i := 0; i < 100; i++ {
+		if d := s.Admit(req("GET", "/", hdr...), person); d.Action != Allow {
+			t.Fatalf("request %d of 100 at once from a known client at the start of an attack was refused: %+v", i, d)
+		}
+	}
+}
+
+// The known clients' budget is set when an attack is declared, from the baseline then: KnownFactor times the usual rate, and
+// at least MinKnownRate (defaults 2 and 50).
+func TestTheKnownBudgetFollowsTheBaselineWhenAnAttackStarts(t *testing.T) {
+	now := time.Date(2026, 10, 6, 9, 0, 0, 0, time.UTC)
+	for _, tc := range []struct {
+		name     string
+		mod      func(*Config)
+		baseline float64
+		want     float64
+	}{
+		{"default factor on a busy site", nil, 100, 200},
+		{"default minimum on a quiet site", nil, 10, 50},
+		{"set factor", func(c *Config) { c.KnownFactor, c.MinKnownRate = 3, 40 }, 100, 300},
+		{"set minimum", func(c *Config) { c.KnownFactor, c.MinKnownRate = 3, 40 }, 5, 40},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s := newTestShield(t, &now, tc.mod)
+			s.det.mu.Lock()
+			s.det.base.rate = tc.baseline
+			s.det.startAttack(now.UnixNano(), aggregate{}, nil, false, false)
+			s.det.mu.Unlock()
+			if got := s.det.info.Load().knownRate; got != tc.want {
+				t.Fatalf("known budget %v, want %v", got, tc.want)
+			}
+		})
 	}
 }
 

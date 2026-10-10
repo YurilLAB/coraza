@@ -126,6 +126,11 @@ type Config struct {
 	// UnknownFactor and MinUnknownRate set the budget during an attack for clients the shield does not know:
 	// UnknownFactor times the usual request rate, and at least MinUnknownRate a second (defaults 1 and 10).
 	UnknownFactor, MinUnknownRate float64
+	// KnownFactor and MinKnownRate set the budget during an attack for known clients: KnownFactor times the usual request
+	// rate, and at least MinKnownRate a second (defaults 2 and 50). Beyond it a known client is treated like any other, so
+	// standing that a botnet earned before it attacks cannot carry the flood past the other budgets. A browser that
+	// answered the challenge is not held to it: the challenge is how people get in when a crowd is taken for an attack.
+	KnownFactor, MinKnownRate float64
 	// BanAfter is how many requests refused during an attack get an address banned (default 30, at most 65535), for
 	// BanFor (default 10 minutes). The count starts again after each ban.
 	BanAfter int
@@ -199,6 +204,8 @@ func (c *Config) defaults() {
 	i(&c.MaxConnsCeiling, 250000)
 	f(&c.UnknownFactor, 1)
 	f(&c.MinUnknownRate, 10)
+	f(&c.KnownFactor, 2)
+	f(&c.MinKnownRate, 50)
 	i(&c.BanAfter, 30)
 	d(&c.BanFor, 10*time.Minute)
 	i(&c.ChallengeBits, 17)
@@ -222,6 +229,7 @@ func (c Config) Validate() error {
 		{"ReservedShare", c.ReservedShare}, {"ClusterShare", c.ClusterShare},
 		{"ConnRate", c.ConnRate}, {"ConnBurst", c.ConnBurst},
 		{"ClusterRate", c.ClusterRate}, {"UnknownFactor", c.UnknownFactor}, {"MinUnknownRate", c.MinUnknownRate},
+		{"KnownFactor", c.KnownFactor}, {"MinKnownRate", c.MinKnownRate},
 		{"Detector.MinAttackRate", c.Detector.MinAttackRate}, {"Detector.Sigmas", c.Detector.Sigmas},
 		{"Detector.LimitMargin", c.Detector.LimitMargin}, {"Detector.MaxScale", c.Detector.MaxScale},
 		{"Detector.RateFactor", c.Detector.RateFactor}, {"Detector.ExitFactor", c.Detector.ExitFactor},
@@ -247,7 +255,8 @@ func (c Config) Validate() error {
 		return errors.New("shield: MaxConns must be at least 16, SubnetConns at least 1 and ReservedShare between 0 and 0.9")
 	case c.ConnRate < 0 || c.ConnBurst < 1:
 		return errors.New("shield: the connection rate must be positive and its burst at least 1")
-	case c.ClusterRate < 0 || c.UnknownFactor < 0 || c.MinUnknownRate < 0 || c.BanAfter < 1 || c.BanAfter > 65535 || c.BanFor < time.Second:
+	case c.ClusterRate < 0 || c.UnknownFactor < 0 || c.MinUnknownRate < 0 || c.KnownFactor < 0 || c.MinKnownRate < 0 ||
+		c.BanAfter < 1 || c.BanAfter > 65535 || c.BanFor < time.Second:
 		return errors.New("shield: attack budgets must not be negative, BanAfter 1 to 65535 and BanFor at least a second")
 	case c.ChallengeBits < 8 || c.ChallengeBits > 24:
 		return errors.New("shield: ChallengeBits must be between 8 and 24")
@@ -286,10 +295,11 @@ type Shield struct {
 	connMu   sync.Mutex
 	connNets map[netip.Prefix]int64
 
-	budgetMu sync.Mutex
-	epoch    uint32
-	cluster  bucket
-	unknown  bucket
+	budgetMu    sync.Mutex
+	epoch       uint32
+	cluster     bucket
+	unknown     bucket
+	knownBudget bucket
 
 	idleMu sync.Mutex
 	idle   idleList
@@ -329,6 +339,7 @@ func New(cfg Config) (*Shield, error) {
 	s.det.refSrc, s.det.refNet = cfg.RequestRate, cfg.SubnetRate
 	s.fdLimit = fdLimit()
 	s.det.unknownRate = func(base float64) float64 { return max(base*cfg.UnknownFactor, cfg.MinUnknownRate) }
+	s.det.knownRate = func(base float64) float64 { return max(base*cfg.KnownFactor, cfg.MinKnownRate) }
 	if cfg.Now == nil {
 		s.wg.Add(1)
 		go s.ticker()
@@ -471,19 +482,26 @@ func (s *Shield) Admit(r *http.Request, client netip.Addr) Decision {
 	if r.URL.Path == VerifyPath {
 		return s.verify(r, key, now)
 	}
-	if info == nil || s.cfg.MonitorOnly || trusted || known || s.cleared(r, key, now) {
+	if info == nil || s.cfg.MonitorOnly || trusted {
 		s.counters.allowed.Add(1)
 		return d
 	}
+	cleared := s.cleared(r, key, now)
 	inCluster := info.fps[fp] || info.paths[pt]
 	s.budgetMu.Lock()
 	if s.epoch != info.epoch { // a new attack: fresh budgets
-		s.epoch, s.cluster, s.unknown = info.epoch, bucket{}, bucket{}
+		s.epoch, s.cluster, s.unknown, s.knownBudget = info.epoch, bucket{}, bucket{}, bucket{}
 	}
 	var ok bool
-	if inCluster {
+	switch {
+	case cleared:
+		ok = true
+	// A known client passes the attack's budgets only within a budget of its own; beyond it, it is like any other client.
+	case known && s.knownBudget.take(ns, info.knownRate, max(info.knownRate, s.cfg.RequestBurst)):
+		ok = true
+	case inCluster:
 		ok = s.cluster.take(ns, info.clusterRate, max(info.clusterRate, 1))
-	} else {
+	default:
 		ok = s.unknown.take(ns, info.unknownRate, max(info.unknownRate, 1))
 	}
 	s.budgetMu.Unlock()
