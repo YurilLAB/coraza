@@ -143,7 +143,9 @@ previous defects. Those results measure their recorded workload, not production 
   and deployment SYN cookies must be installed separately.
 - A patient botnet can earn reputation by behaving normally before attacking. The known-client
   budget caps what that standing lets through; beyond it the bots are challenged or refused like
-  strangers, and an address banned for repeated refusals loses its standing.
+  strangers, and an address banned for repeated refusals loses its standing. Known clients share one budget, so a botnet with
+  standing can use it up; returning visitors are then challenged like anyone else, and an API client that cannot answer a challenge
+  is refused.
 - Limits follow the busiest address and network, not each address's own history: one address that
   sends heavily for tens of minutes without an attack being declared raises the per-address limit
   for every address, up to 20 times the floor.
