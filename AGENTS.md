@@ -718,6 +718,13 @@ honestly: the checklist is a contract, not decoration.
 ### Commits
 
 - Small, self-contained commits with the same title style as PRs.
+- Keep the message short, as in the history: a title of at most 72 characters,
+  then either nothing or one paragraph of two to five lines, wrapped at 72, that
+  says what the code does now and why. Read `git log` before writing one and
+  match it.
+- Test counts, measurements, review notes and step-by-step accounts of the work
+  do not go in a commit message. They belong in the PR description or in a dated
+  record under `docs/`.
 - Do not commit generated files by hand; run `go run mage.go format`.
 - Do not commit build artifacts (`build/`), coverage files or editor settings.
 
